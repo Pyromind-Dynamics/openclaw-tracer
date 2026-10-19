@@ -3,6 +3,9 @@
 
 # ========== Core (proxy server) ==========
 litellm[proxy]>=1.74.0
+# LiteLLM proxy auth/error path imports prisma; without it, missing API key
+# surfaces as ModuleNotFoundError → HTTP 500 instead of 401.
+prisma>=0.11.0
 pydantic>=2.11.0
 fastapi>=0.115.0
 uvicorn[standard]>=0.38.0

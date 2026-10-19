@@ -17,7 +17,9 @@ COPY requirements-prod.txt .
 RUN python -m venv /venv \
     && /venv/bin/pip install --no-cache-dir --upgrade pip \
     && /venv/bin/pip install --no-cache-dir -r requirements-prod.txt \
-    && /venv/bin/pip install --no-cache-dir "pyromind-sdk==0.1.2"
+    && /venv/bin/pip install --no-cache-dir "prisma>=0.11.0" \
+    && /venv/bin/pip install --no-cache-dir "pyromind-sdk==0.1.11" \
+    && /venv/bin/python -c "import prisma; print('prisma-ok')"
     
 # ============================================
 # Stage 2: Runtime - slim image, no compiler

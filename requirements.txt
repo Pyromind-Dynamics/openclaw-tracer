@@ -1,5 +1,6 @@
 # ========== Core Dependencies ==========
 litellm[proxy]          # LiteLLM proxy server for LLM provider abstraction
+prisma>=0.11.0                  # Required by LiteLLM proxy auth/error handlers
 pydantic>=2.11.0                # Data validation and settings
 fastapi>=0.115.0                # API server framework
 uvicorn[standard]>=0.38.0       # ASGI server with extras
