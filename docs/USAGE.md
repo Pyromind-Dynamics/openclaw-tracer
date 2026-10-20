@@ -14,6 +14,7 @@
 6. [OpenClaw 集成](#6-openclaw-集成)
 7. [API 参考](#7-api-参考)
 8. [常见问题](#8-常见问题)
+9. [热切流与模型 CRUD](#9-热切流与模型-crud)
 
 ---
 
@@ -761,3 +762,86 @@ await store.flush()
 1. 只在需要时保存完整思考链
 2. 考虑压缩或摘要
 3. 分开存储（thinking 字段单独一个 Parquet 文件）
+
+---
+
+## 9. 热切流与模型 CRUD
+
+对外 **逻辑模型名**（`model_name`，客户端 `/v1/models` 与请求里的 `model`）保持稳定；运维通过 Admin API **增删改查后端 deployment**（`api_base` + 上游 model + `weight`），实现 A/B、热迁移、热切流。
+
+### 9.1 鉴权分离
+
+| 密钥 | 用途 |
+|------|------|
+| `PROXY_API_KEY` | 客户端调 `/v1/chat/completions` 等 |
+| `ACCESS_KEY` | 上游模型服务密钥（写在 deployment `litellm_params.api_key`） |
+| `ADMIN_API_KEY` | **仅** `/admin/routing/**`；未设置则 admin 返回 503 |
+
+`PROXY_API_KEY` 与 `ADMIN_API_KEY` **互不通用**。
+
+```bash
+export ADMIN_API_KEY="your-admin-key"
+```
+
+### 9.2 推荐切流顺序（对外名不变）
+
+1. `POST /admin/routing/deployments` 追加新后端  
+2. （可选）`PATCH /admin/routing/weights` 灰度迁移  
+3. `DELETE /admin/routing/deployments/{id}` 删除旧后端（默认 `drain=true`，等在途请求结束）
+
+### 9.3 curl 示例
+
+```bash
+BASE=http://localhost:43886
+ADMIN_HDR="Authorization: Bearer ${ADMIN_API_KEY}"
+
+# 全量查询
+curl -s -H "$ADMIN_HDR" "$BASE/admin/routing" | jq .
+
+# 同一逻辑名下追加后端（A/B）
+curl -s -X POST -H "$ADMIN_HDR" -H "Content-Type: application/json" \
+  "$BASE/admin/routing/deployments" \
+  -d '{
+    "reason": "ab_test",
+    "deployment": {
+      "model_name": "pcb_avi_sft_merge_v10",
+      "litellm_params": {
+        "model": "openai/pcb_avi_sft_merge_v10",
+        "api_base": "https://backend-b.example/v1",
+        "api_key": "'"${ACCESS_KEY}"'",
+        "weight": 50
+      }
+    }
+  }' | jq .
+
+# 热迁移改权重
+curl -s -X PATCH -H "$ADMIN_HDR" -H "Content-Type: application/json" \
+  "$BASE/admin/routing/weights" \
+  -d '{
+    "reason": "migration",
+    "model_name": "pcb_avi_sft_merge_v10",
+    "weights": [
+      {"id": "<deploy-a-uuid>", "weight": 10},
+      {"id": "<deploy-b-uuid>", "weight": 90}
+    ]
+  }' | jq .
+
+# 删除旧后端（默认 drain）
+curl -s -X DELETE -H "$ADMIN_HDR" -H "Content-Type: application/json" \
+  "$BASE/admin/routing/deployments/<deploy-a-uuid>" \
+  -d '{"reason":"cutover","drain":true}' | jq .
+```
+
+### 9.4 环境变量
+
+| 变量 | 默认 | 说明 |
+|------|------|------|
+| `ADMIN_API_KEY` | （空） | 启用 admin CRUD |
+| `ROUTING_STATE_PATH` | `{output_dir}/routing_state.json` | 路由落盘；启动优先恢复 |
+| `ROUTING_DRAIN_TIMEOUT_SECONDS` | `120` | drain 超时；超时返回 409 且不提交 |
+| `ROUTING_CHANGE_CALLBACK_URL` | （空） | 变更成功后异步 POST JSON（密钥已脱敏） |
+| `ROUTING_CHANGE_CALLBACK_TIMEOUT` | `5` | HTTP 回调超时（秒） |
+| `ROUTING_CHANGE_CALLBACK_SCRIPT` | （空） | 变更成功后异步执行 shell，argv 传入 JSON 临时文件路径 |
+| `ROUTING_CHANGE_CALLBACK_SCRIPT_TIMEOUT` | `30` | shell 回调超时（秒） |
+
+URL 与 SCRIPT 都空则跳过回调；都配置则先调度 HTTP 再调度 shell。

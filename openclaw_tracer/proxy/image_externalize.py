@@ -45,12 +45,18 @@ def _to_rgb(img: Image.Image) -> Image.Image:
     return img.convert("RGB")
 
 
+# Default under spans/ so media shares the same tree as parquet shards
+# (batch mode: spans/<n>/media/images/...; deleted with the batch).
+DEFAULT_MEDIA_IMAGES_PREFIX = "spans/media/images"
+
+
 def _write_data_url_as_jpeg(
     data_url: str,
     output_dir: Path,
     trace_id: str,
     span_id: str,
     index: _ImageIndex,
+    media_images_prefix: str = DEFAULT_MEDIA_IMAGES_PREFIX,
 ) -> Optional[str]:
     m = _DATA_IMAGE_BASE64.match(data_url.strip())
     if not m:
@@ -77,7 +83,8 @@ def _write_data_url_as_jpeg(
         return None
 
     idx = index.next()
-    rel = Path("media") / "images" / trace_id / f"{span_id}_{idx}.jpg"
+    prefix = media_images_prefix.strip("/").replace("\\", "/")
+    rel = Path(*prefix.split("/")) / trace_id / f"{span_id}_{idx}.jpg"
     abs_path = output_dir / rel
     abs_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -90,10 +97,19 @@ def _write_data_url_as_jpeg(
     return rel.as_posix()
 
 
-def _externalize_url(url: str, output_dir: Path, trace_id: str, span_id: str, index: _ImageIndex) -> str:
+def _externalize_url(
+    url: str,
+    output_dir: Path,
+    trace_id: str,
+    span_id: str,
+    index: _ImageIndex,
+    media_images_prefix: str = DEFAULT_MEDIA_IMAGES_PREFIX,
+) -> str:
     if not url.startswith("data:"):
         return url
-    replaced = _write_data_url_as_jpeg(url, output_dir, trace_id, span_id, index)
+    replaced = _write_data_url_as_jpeg(
+        url, output_dir, trace_id, span_id, index, media_images_prefix
+    )
     if replaced is None:
         return url
     return replaced
@@ -105,10 +121,13 @@ def _externalize_image_url_obj(
     trace_id: str,
     span_id: str,
     index: _ImageIndex,
+    media_images_prefix: str = DEFAULT_MEDIA_IMAGES_PREFIX,
 ) -> None:
     url = obj.get("url")
     if isinstance(url, str):
-        obj["url"] = _externalize_url(url, output_dir, trace_id, span_id, index)
+        obj["url"] = _externalize_url(
+            url, output_dir, trace_id, span_id, index, media_images_prefix
+        )
 
 
 def _externalize_content_part(
@@ -117,14 +136,19 @@ def _externalize_content_part(
     trace_id: str,
     span_id: str,
     index: _ImageIndex,
+    media_images_prefix: str = DEFAULT_MEDIA_IMAGES_PREFIX,
 ) -> None:
     if not isinstance(part, dict):
         return
     ptype = part.get("type")
     if ptype == "image_url" and isinstance(part.get("image_url"), dict):
-        _externalize_image_url_obj(part["image_url"], output_dir, trace_id, span_id, index)
+        _externalize_image_url_obj(
+            part["image_url"], output_dir, trace_id, span_id, index, media_images_prefix
+        )
     elif ptype == "image_url" and isinstance(part.get("image_url"), str):
-        part["image_url"] = _externalize_url(part["image_url"], output_dir, trace_id, span_id, index)
+        part["image_url"] = _externalize_url(
+            part["image_url"], output_dir, trace_id, span_id, index, media_images_prefix
+        )
 
 
 def externalize_message_content(
@@ -133,6 +157,7 @@ def externalize_message_content(
     trace_id: str,
     span_id: str,
     index: _ImageIndex,
+    media_images_prefix: str = DEFAULT_MEDIA_IMAGES_PREFIX,
 ) -> Any:
     if isinstance(content, str):
         return content
@@ -141,14 +166,18 @@ def externalize_message_content(
         for item in content:
             if isinstance(item, dict):
                 block = copy.deepcopy(item)
-                _externalize_content_part(block, output_dir, trace_id, span_id, index)
+                _externalize_content_part(
+                    block, output_dir, trace_id, span_id, index, media_images_prefix
+                )
                 out.append(block)
             else:
                 out.append(copy.deepcopy(item))
         return out
     if isinstance(content, dict):
         block = copy.deepcopy(content)
-        _externalize_content_part(block, output_dir, trace_id, span_id, index)
+        _externalize_content_part(
+            block, output_dir, trace_id, span_id, index, media_images_prefix
+        )
         return block
     return content
 
@@ -159,10 +188,12 @@ def externalize_inline_images_for_span(
     span_id: str,
     messages_for_storage: List[Dict[str, Any]],
     system_message: Any,
+    media_images_prefix: str = DEFAULT_MEDIA_IMAGES_PREFIX,
 ) -> tuple[List[Dict[str, Any]], Any]:
     """Deep-copy messages and system content; replace data:image base64 URLs with JPEG paths.
 
-    Paths are POSIX strings relative to ``output_dir`` (e.g. ``media/images/...``).
+    Paths are POSIX strings relative to ``output_dir``, under ``media_images_prefix``
+    (default ``spans/media/images/...``; batch mode uses ``spans/<n>/media/images/...``).
     ``http(s)`` URLs are left unchanged. On decode/write failure the original URL is kept.
     """
     index = _ImageIndex()
@@ -171,7 +202,12 @@ def externalize_inline_images_for_span(
         m = copy.deepcopy(msg)
         if "content" in m:
             m["content"] = externalize_message_content(
-                m["content"], output_dir, trace_id, span_id, index
+                m["content"],
+                output_dir,
+                trace_id,
+                span_id,
+                index,
+                media_images_prefix,
             )
         out_messages.append(m)
 
@@ -180,7 +216,12 @@ def externalize_inline_images_for_span(
         out_system = system_message
     else:
         out_system = externalize_message_content(
-            system_message, output_dir, trace_id, span_id, index
+            system_message,
+            output_dir,
+            trace_id,
+            span_id,
+            index,
+            media_images_prefix,
         )
 
     return out_messages, out_system

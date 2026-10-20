@@ -102,6 +102,12 @@ async def main(
 
     print(f"✓ 代理鉴权已启用 (PROXY_API_KEY: {proxy_api_key[:8]}...)")
 
+    admin_api_key = (os.getenv("ADMIN_API_KEY") or "").strip() or None
+    if admin_api_key:
+        print("✓ Admin API 已启用 (ADMIN_API_KEY set)")
+    else:
+        print("⚠ ADMIN_API_KEY 未设置，/admin/routing 将返回 503")
+
     # 加载模型配置
     model_list = []
 
@@ -197,6 +203,7 @@ async def main(
         log_file=log_file,
         proxy_api_key=proxy_api_key,
         task_timeout_minutes=task_timeout_minutes,
+        admin_api_key=admin_api_key,
     )
 
     # 启动
@@ -216,6 +223,7 @@ async def main(
     print(f"  Time Window: {time_window_minutes} 分钟")
     print(f"  Flush间隔:  {flush_interval_seconds}s ({flush_interval_seconds // 60}min)")
     print(f"  Auth:       启用 (PROXY_API_KEY)")
+    print(f"  Admin:      {'启用 (ADMIN_API_KEY)' if admin_api_key else '未启用'}")
     if log_file:
         print(f"  HTTP Log:   {log_file}")
     print("=" * 60)

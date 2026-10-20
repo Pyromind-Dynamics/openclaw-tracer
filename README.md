@@ -2,9 +2,9 @@
 
 # OpenClaw-Tracer
 
+[中文文档](README_ZH.md)
 
 OpenClaw-Tracer is a lightweight LLM data collection and tracing service for **OpenClaw** and other agent/LLM systems, built on LiteLLM. It sits in front of your agents as an OpenAI-compatible proxy, automatically capturing rich conversation and trace data (reasoning, tool calls, token usage, latency, etc.) for SFT/RL training and observability.
-![Architecture](img/arch.png)
 
 ## Features
 
@@ -15,59 +15,9 @@ OpenClaw-Tracer is a lightweight LLM data collection and tracing service for **O
 - **Docker‑friendly deployment**: Simple to run locally or in production with Docker / Docker Compose
 - **Configurable buffering**: Tune buffering for immediate or batched writes depending on your workload
 
-## Task 追踪功能
-
-OpenClaw-Tracer 支持 task 追踪和奖励信号捕获，用于 RL 训练数据收集。
-
-### 请求头
-
-| 请求头 | 类型 | 必填 | 描述 |
-|--------|------|------|------|
-| `X-Task-ID` | string | 否 | 任务标识符，用作 rollout_id |
-| `X-Previous-Reward` | float | 否 | 上一步的奖励值 |
-
-### 示例
-
-```bash
-curl http://localhost:43886/v1/chat/completions \
-  -H "Content-Type: application/json" \
-  -H "Authorization: Bearer your-proxy-key" \
-  -H "X-Task-ID: my-task-123" \
-  -H "X-Previous-Reward: 0.85" \
-  -d '{
-    "model": "gpt-4",
-    "messages": [{"role": "user", "content": "Hello!"}]
-  }'
-```
-
-### API 端点
-
-#### GET /tracer-version
-
-获取 tracer 版本信息（无需认证）。
-
-```bash
-curl http://localhost:43886/tracer-version
-```
-
-#### POST /end_task
-
-结束指定 task 会话。可选传入本轮 **最终 reward**（episode 级别）：优先使用字段 `final_reward`，若省略则用别名 `reward`；二者同时存在时以 `final_reward` 为准。未传入时响应里 `final_reward` 为 `null`。无效数字返回 400。
-
-```bash
-curl -X POST http://localhost:43886/end_task \
-  -H "Content-Type: application/json" \
-  -H "Authorization: Bearer your-proxy-key" \
-  -d '{"task_id": "my-task-123", "final_reward": 1.0}'
-```
-
-### 环境变量
-
-| 变量 | 默认值 | 描述 |
-|------|--------|------|
-| `TASK_TIMEOUT_MINUTES` | 10 | task 超时时间（分钟） |
-
 ## Architecture
+
+![Architecture](img/arch.png)
 
 ```
 OpenClaw / Chatbox / other clients → OpenClaw-Tracer → upstream provider
@@ -165,8 +115,9 @@ Create `config/models.json` with your model configurations:
 | Variable | Required | Description |
 |----------|----------|-------------|
 | `PROXY_API_KEY` | **Yes** | API key for proxy authentication |
+| `ADMIN_API_KEY` | No | Admin key for `/admin/routing/**` only (hot switch / deployment CRUD). Not interchangeable with `PROXY_API_KEY`. |
 
-**Important:** The service will not start without `PROXY_API_KEY` set.
+**Important:** The service will not start without `PROXY_API_KEY` set. See [docs/USAGE.md §9](docs/USAGE.md#9-热切流与模型-crud) for hot cutover, A/B weights, drain, and routing callbacks.
 
 #### Basic Configuration
 
@@ -338,6 +289,7 @@ docker run -d \
 | `TRAJECTORY_BUFFER_SIZE` | No | `0` | Max buffer size, old data flushed when exceeded (0 = disabled) |
 | `TIME_WINDOW_MINUTES` | No | `30` | Periodic flush interval in minutes |
 | `PROXY_API_KEY` | Yes | - | API key for proxy authentication |
+| `ADMIN_API_KEY` | No | - | Admin key for `/admin/routing/**` only |
 
 **Buffer Behavior:**
 | Configuration | Behavior |
@@ -433,6 +385,136 @@ curl http://localhost:43886/v1/models
 ### Permission errors
 - Ensure `data/` and `logs/` directories are writable
 - Check volume mount permissions in Docker
+
+## Task Tracking
+
+OpenClaw-Tracer supports task tracking and reward-signal capture for RL training data collection.
+
+### Request Headers
+
+| Header | Type | Required | Description |
+|--------|------|----------|-------------|
+| `X-Task-ID` | string | No | Task identifier, used as `rollout_id` |
+| `X-Previous-Reward` | float | No | Reward value from the previous step |
+| `X-Task-No-Trace` | bool | No | If `1` / `true` / `yes` / `on`, proxy the request but **do not** write a span to storage |
+
+### Example
+
+```bash
+curl http://localhost:43886/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer your-proxy-key" \
+  -H "X-Task-ID: my-task-123" \
+  -H "X-Previous-Reward: 0.85" \
+  -d '{
+    "model": "gpt-4",
+    "messages": [{"role": "user", "content": "Hello!"}]
+  }'
+```
+
+Skip tracing for a single request:
+
+```bash
+curl http://localhost:43886/v1/chat/completions \
+  -H "Authorization: Bearer your-proxy-key" \
+  -H "X-Task-No-Trace: true" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"gpt-4","messages":[{"role":"user","content":"ping"}]}'
+```
+
+### API Endpoints
+
+#### GET /tracer-version
+
+Return tracer version information (no authentication required).
+
+```bash
+curl http://localhost:43886/tracer-version
+```
+
+#### POST /end_task
+
+End a task session. Optionally pass the episode-level **final reward**: prefer the field `final_reward`; if omitted, the alias `reward` is accepted. When both are present, `final_reward` wins. If neither is passed, the response `final_reward` is `null`. Invalid numbers return 400.
+
+```bash
+curl -X POST http://localhost:43886/end_task \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer your-proxy-key" \
+  -d '{"task_id": "my-task-123", "final_reward": 1.0}'
+```
+
+#### POST /flush
+
+Flush in-memory span buffers to Parquet immediately (`PROXY_API_KEY` required). Optional `trigger_workflow` (query or JSON body, default `false`) also schedules the buffer-full workflow trigger script.
+
+```bash
+curl -X POST http://localhost:43886/flush \
+  -H "Authorization: Bearer your-proxy-key" \
+  -H "Content-Type: application/json" \
+  -d '{"trigger_workflow": false}'
+```
+
+### Environment Variables
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `TASK_TIMEOUT_MINUTES` | 10 | Task timeout in minutes |
+
+## Callbacks
+
+All callbacks are **async / fire-and-forget** (failures are logged only; they do not fail the client request).
+
+### 1) Workflow trigger (after buffer-full flush)
+
+Fired when a flush is caused by the buffer filling (`BUFFER_SIZE`), or when `POST /flush` is called with `trigger_workflow=true`. Time-window-only flushes do **not** trigger this.
+
+| Variable | Description |
+|----------|-------------|
+| `ENABLE_WORKFLOW_TRIGGER` | Default on; set `0`/`false` to disable |
+| `WORKFLOW_TRIGGER_SCRIPT` | Shell script path; argv receives no JSON (legacy) — see `workflow_trigger.py` |
+
+### 2) Routing change (admin hot-switch / CRUD)
+
+Fired after a successful `reload_models` from `/admin/routing/**`. Payload keys are redacted (`api_key`).
+
+| Variable | Description |
+|----------|-------------|
+| `ROUTING_CHANGE_CALLBACK_URL` | Optional async HTTP POST JSON |
+| `ROUTING_CHANGE_CALLBACK_TIMEOUT` | HTTP timeout seconds (default `5`) |
+| `ROUTING_CHANGE_CALLBACK_SCRIPT` | Optional shell; argv = path to JSON tempfile |
+| `ROUTING_CHANGE_CALLBACK_SCRIPT_TIMEOUT` | Script timeout seconds (default `30`) |
+
+Event shape: `{"event":"routing.updated","reason":"...","previous":[],"current":[],"op":{...}}`.
+
+### 3) Data delete (trajectory batch roll-off)
+
+When `TRAJECTORY_BUFFER_SIZE > 0`, advancing batches may delete old `spans/<n>/` directories (including nested `media/images/` for that batch). Each successful delete schedules this callback.
+
+Inline images are stored under the same tree as spans: `spans/media/images/...` (non-batch) or `spans/<n>/media/images/...` (batch), so roll-off removes parquet and media together.
+
+| Variable | Description |
+|----------|-------------|
+| `DATA_DELETE_CALLBACK_URL` | Optional async HTTP POST JSON |
+| `DATA_DELETE_CALLBACK_TIMEOUT` | HTTP timeout seconds (default `5`) |
+| `DATA_DELETE_CALLBACK_SCRIPT` | Optional shell; argv = path to JSON tempfile |
+| `DATA_DELETE_CALLBACK_SCRIPT_TIMEOUT` | Script timeout seconds (default `30`) |
+
+Event shape:
+
+```json
+{
+  "event": "data.deleted",
+  "reason": "batch_advance",
+  "timestamp": "<iso8601>",
+  "paths": ["/app/data/spans/0"],
+  "batch_index": 0,
+  "extra": {
+    "current_batch_index": 3,
+    "buffer_size": 100,
+    "trajectory_buffer_size": 10000
+  }
+}
+```
 
 ## Roadmap / TODO
 

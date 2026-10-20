@@ -8,6 +8,7 @@ import contextvars
 import json
 import logging
 import os
+from copy import deepcopy
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Set, Union
@@ -246,7 +247,7 @@ class AuthMiddleware:
     Authentication failures return 401 Unauthorized with JSON error response.
     """
 
-    # Paths that don't require authentication
+    # Paths that don't require PROXY_API_KEY authentication
     PUBLIC_PATHS = {"/health", "/status", "/v1/models", "/tracer-version"}
 
     def __init__(self, api_key: str):
@@ -258,6 +259,10 @@ class AuthMiddleware:
         if not api_key:
             raise ValueError("PROXY_API_KEY must be set and non-empty")
         self.api_key = api_key
+
+    @staticmethod
+    def _is_admin_path(path: str) -> bool:
+        return path == "/admin" or path.startswith("/admin/")
 
     def _extract_api_key(self, headers: Dict[str, str]) -> Optional[str]:
         """Extract API key from request headers.
@@ -312,8 +317,8 @@ class AuthMiddleware:
             - If authenticated: (True, None)
             - If not authenticated: (False, error_response_dict)
         """
-        # Skip authentication for public paths
-        if path in self.PUBLIC_PATHS:
+        # Skip PROXY auth for public paths and admin routes (admin uses ADMIN_API_KEY)
+        if path in self.PUBLIC_PATHS or self._is_admin_path(path):
             return True, None
 
         # Extract API key from headers
@@ -330,6 +335,54 @@ class AuthMiddleware:
 
         # Authentication successful
         return True, None
+
+
+class InflightTracker:
+    """Count in-flight inference requests for routing drain."""
+
+    INFERENCE_PREFIXES = (
+        "/v1/chat/completions",
+        "/v1/completions",
+        "/v1/embeddings",
+        "/chat/completions",
+        "/completions",
+    )
+
+    def __init__(self) -> None:
+        self._count = 0
+        self._lock = asyncio.Lock()
+        self._zero = asyncio.Event()
+        self._zero.set()
+
+    @property
+    def count(self) -> int:
+        return self._count
+
+    @classmethod
+    def is_inference_path(cls, path: str) -> bool:
+        return any(path == p or path.startswith(p + "/") for p in cls.INFERENCE_PREFIXES) or path in {
+            "/v1/chat/completions",
+            "/v1/completions",
+            "/v1/embeddings",
+        }
+
+    async def enter(self) -> None:
+        async with self._lock:
+            self._count += 1
+            self._zero.clear()
+
+    async def exit(self) -> None:
+        async with self._lock:
+            self._count = max(0, self._count - 1)
+            if self._count == 0:
+                self._zero.set()
+
+    async def wait_zero(self, timeout: float) -> bool:
+        try:
+            await asyncio.wait_for(self._zero.wait(), timeout=timeout)
+            return True
+        except asyncio.TimeoutError:
+            return False
 
 
 def _to_timestamp(value: Union[datetime, float, int, None]) -> Optional[float]:
@@ -549,6 +602,10 @@ class SpanLogger(CustomLogger):
         """Replace data-URL images with on-disk JPEG paths relative to the store output dir."""
         if self._media_output_dir is None:
             return messages_for_storage, system_message
+        media_prefix = "spans/media/images"
+        prepare = getattr(self.store, "prepare_media_images_prefix", None)
+        if callable(prepare):
+            media_prefix = prepare()
         return await asyncio.to_thread(
             externalize_inline_images_for_span,
             self._media_output_dir,
@@ -556,6 +613,7 @@ class SpanLogger(CustomLogger):
             span_id,
             messages_for_storage,
             system_message,
+            media_prefix,
         )
 
     async def async_log_success_event(self, kwargs, response_obj, start_time, end_time):
@@ -571,6 +629,9 @@ class SpanLogger(CustomLogger):
         try:
             # Get task context from contextvars
             ctx = task_context.get() or {}
+            if ctx.get("no_trace"):
+                logger.debug("Skipping span capture due to X-Task-No-Trace")
+                return
             task_id = ctx.get("task_id")
             attempt_id = ctx.get("attempt_id")
             previous_reward = ctx.get("previous_reward")
@@ -902,6 +963,9 @@ class SpanLogger(CustomLogger):
         try:
             # Get task context from contextvars
             ctx = task_context.get() or {}
+            if ctx.get("no_trace"):
+                logger.debug("Skipping failure span capture due to X-Task-No-Trace")
+                return
             task_id = ctx.get("task_id")
             attempt_id = ctx.get("attempt_id")
             previous_reward = ctx.get("previous_reward")
@@ -994,6 +1058,8 @@ class LLMProxy:
         log_file: Optional[str] = None,
         proxy_api_key: Optional[str] = None,
         task_timeout_minutes: int = 10,
+        admin_api_key: Optional[str] = None,
+        routing_state_path: Optional[str | Path] = None,
     ):
         """Initialize the LLM proxy.
 
@@ -1006,7 +1072,15 @@ class LLMProxy:
             log_file: Path to HTTP access log file (JSONL format).
             proxy_api_key: API key for proxy authentication. Required.
             task_timeout_minutes: Minutes of inactivity before a task is cleaned up.
+            admin_api_key: Separate key for /admin/routing APIs (optional).
+            routing_state_path: Optional path for persisted routing state.
         """
+        from openclaw_tracer.routing_state import (
+            ensure_deployment_ids,
+            load_routing_state,
+            resolve_routing_state_path,
+        )
+
         # Pick random port if not specified
         if port is None:
             self.port = pick_unused_port()
@@ -1015,11 +1089,32 @@ class LLMProxy:
         self.host = host
         self.num_workers = num_workers
 
-        # Model list
-        self.model_list = model_list or []
-
         # Storage backend
         self.store = store or ParquetStore()
+
+        output_dir = getattr(self.store, "output_dir", None) or "./data"
+        self.routing_state_path = resolve_routing_state_path(
+            output_dir=output_dir, explicit=routing_state_path
+        )
+
+        # Model list: prefer persisted routing state when present
+        initial_list = model_list or []
+        saved = load_routing_state(self.routing_state_path)
+        if saved and isinstance(saved.get("model_list"), list):
+            initial_list = saved["model_list"]
+            self.routing_updated_at = saved.get("updated_at")
+            logger.info(
+                "[Routing] Restored %s deployment(s) from %s",
+                len(initial_list),
+                self.routing_state_path,
+            )
+        else:
+            self.routing_updated_at = None
+
+        self.model_list = ensure_deployment_ids(initial_list)
+        self._routing_lock = asyncio.Lock()
+        self.inflight = InflightTracker()
+        self.admin_api_key = (admin_api_key or os.getenv("ADMIN_API_KEY") or "").strip() or None
 
         # Span logger
         self.span_logger = SpanLogger(self.store)
@@ -1040,6 +1135,11 @@ class LLMProxy:
         else:
             self.auth_middleware = None
             logger.warning("[Auth] No PROXY_API_KEY provided, running without authentication")
+
+        if self.admin_api_key:
+            logger.info("[Auth] Admin API enabled (ADMIN_API_KEY set)")
+        else:
+            logger.warning("[Auth] ADMIN_API_KEY not set; /admin/routing will return 503")
 
         # Task Manager for session management
         self.task_manager = TaskManager(timeout_minutes=task_timeout_minutes)
@@ -1107,42 +1207,8 @@ class LLMProxy:
         if self.http_logger.log_file:
             logger.info(f"HTTP access log: {self.http_logger.log_file}")
 
-        # Load configuration into LiteLLM proxy
-        from litellm.proxy.proxy_server import proxy_config
-        import tempfile
-
-        # Create YAML config from model_list
-        yaml_content = "model_list:\n"
-        for model in self.model_list:
-            yaml_content += f"  - model_name: {model['model_name']}\n"
-            yaml_content += f"    litellm_params:\n"
-            for key, value in model['litellm_params'].items():
-                if isinstance(value, str):
-                    yaml_content += f"      {key}: \"{value}\"\n"
-                else:
-                    yaml_content += f"      {key}: {value}\n"
-
-        # Write to temp file and load
-        with tempfile.NamedTemporaryFile(mode='w', suffix='.yaml', delete=False) as f:
-            f.write(yaml_content)
-            config_file = f.name
-
-        try:
-            # Load config into proxy
-            from litellm.proxy import proxy_server
-            new_router, model_list_result, _ = await proxy_config.load_config(None, config_file)
-
-            # Set the new router to proxy_server
-            proxy_server.llm_router = new_router
-            # LiteLLM /health expects this global; load_config returns the list but does not
-            # always publish it to proxy_server.llm_model_list when embedded programmatically.
-            proxy_server.llm_model_list = model_list_result
-
-            logger.info(f"Loaded {len(self.model_list)} model(s) from config")
-        finally:
-            # Clean up temp file
-            import os
-            os.unlink(config_file)
+        # Load configuration into LiteLLM proxy (hot-reloadable)
+        await self._load_router(self.model_list, persist=True, reason="startup")
 
         # Add the custom loggers
         from litellm import logging_callback_manager
@@ -1161,6 +1227,11 @@ class LLMProxy:
 
         # Register /status endpoint for collection progress
         self._register_status_route(app)
+
+        # Admin routing CRUD
+        from openclaw_tracer.routing_admin import register_routing_admin_routes
+
+        register_routing_admin_routes(app, self)
 
         self._app = app
 
@@ -1187,6 +1258,162 @@ class LLMProxy:
         logger.info(f"LLM proxy started on http://{self.host}:{self.port}")
         logger.info(f"Models available: {[m.get('model_name', m.get('model')) for m in self.model_list]}")
 
+    def _drain_timeout_seconds(self) -> float:
+        raw = os.getenv("ROUTING_DRAIN_TIMEOUT_SECONDS", "120")
+        try:
+            return max(0.0, float(raw))
+        except ValueError:
+            return 120.0
+
+    async def _load_router(
+        self,
+        model_list: List[Dict[str, Any]],
+        *,
+        persist: bool = True,
+        reason: str = "reload",
+        previous: Optional[List[Dict[str, Any]]] = None,
+        op: Optional[Dict[str, Any]] = None,
+        schedule_callback: bool = False,
+    ) -> Dict[str, Any]:
+        """Load model_list into LiteLLM router; optionally persist and callback."""
+        from datetime import timezone
+
+        from litellm.proxy.proxy_server import proxy_config
+        from litellm.proxy import proxy_server
+
+        from openclaw_tracer.routing_state import (
+            ensure_deployment_ids,
+            model_list_to_yaml,
+            save_routing_state,
+        )
+
+        prepared = ensure_deployment_ids(model_list)
+        yaml_content = model_list_to_yaml(prepared)
+        config_file: Optional[str] = None
+        try:
+            import tempfile
+
+            with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False) as fh:
+                fh.write(yaml_content)
+                config_file = fh.name
+
+            new_router, model_list_result, _ = await proxy_config.load_config(
+                None, config_file
+            )
+            proxy_server.llm_router = new_router
+            proxy_server.llm_model_list = model_list_result
+        finally:
+            if config_file:
+                try:
+                    os.unlink(config_file)
+                except OSError:
+                    pass
+
+        prev = previous if previous is not None else deepcopy(self.model_list)
+        self.model_list = prepared
+        updated_at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+        self.routing_updated_at = updated_at
+
+        if persist:
+            save_routing_state(self.routing_state_path, prepared, updated_at=updated_at)
+
+        logger.info(
+            "[Routing] Loaded %s deployment(s) reason=%s path=%s",
+            len(prepared),
+            reason,
+            self.routing_state_path if persist else "(no persist)",
+        )
+
+        if schedule_callback:
+            from openclaw_tracer.routing_callback import (
+                build_routing_event,
+                schedule_routing_change_callback,
+            )
+
+            payload = build_routing_event(
+                reason=reason,
+                previous=prev,
+                current=prepared,
+                op=op,
+            )
+            schedule_routing_change_callback(payload)
+
+        return {
+            "updated_at": updated_at,
+            "model_list": prepared,
+            "deployment_count": len(prepared),
+        }
+
+    async def reload_models(
+        self,
+        model_list: List[Dict[str, Any]],
+        *,
+        reason: str = "reload",
+        op: Optional[Dict[str, Any]] = None,
+        persist: bool = True,
+        schedule_callback: bool = True,
+    ) -> Dict[str, Any]:
+        """Replace in-memory LiteLLM router with a new model_list."""
+        previous = deepcopy(self.model_list)
+        return await self._load_router(
+            model_list,
+            persist=persist,
+            reason=reason,
+            previous=previous,
+            op=op,
+            schedule_callback=schedule_callback,
+        )
+
+    async def apply_model_list(
+        self,
+        model_list: List[Dict[str, Any]],
+        *,
+        reason: str = "manual",
+        drain: bool = False,
+        op: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """Validate, optionally drain, then reload + persist + callback.
+
+        Raises:
+            RoutingApplyError: validation or drain timeout (router unchanged).
+        """
+        from openclaw_tracer.routing_admin import RoutingApplyError
+        from openclaw_tracer.routing_state import (
+            ensure_deployment_ids,
+            validate_weights_for_model_names,
+        )
+
+        prepared = ensure_deployment_ids(model_list)
+        weight_err = validate_weights_for_model_names(prepared)
+        if weight_err:
+            raise RoutingApplyError(weight_err, code="invalid_weights", status_code=400)
+
+        async with self._routing_lock:
+            if drain:
+                timeout = self._drain_timeout_seconds()
+                logger.info(
+                    "[Routing] Draining inflight=%s timeout=%ss before reason=%s",
+                    self.inflight.count,
+                    timeout,
+                    reason,
+                )
+                ok = await self.inflight.wait_zero(timeout)
+                if not ok:
+                    raise RoutingApplyError(
+                        f"drain timed out after {timeout}s "
+                        f"(inflight={self.inflight.count})",
+                        code="drain_timeout",
+                        status_code=409,
+                    )
+
+            return await self.reload_models(
+                prepared,
+                reason=reason,
+                op=op,
+                persist=True,
+                schedule_callback=True,
+            )
+
     def _setup_http_middleware(self, fastapi_app: Any) -> None:
         """Set up HTTP logging and authentication middleware for the FastAPI app.
 
@@ -1206,11 +1433,20 @@ class LLMProxy:
         fastapi_app.add_middleware(TaskMiddleware, task_manager=self.task_manager)
         logger.info("[TaskMiddleware] Added to middleware chain")
 
+        inflight_tracker = self.inflight
+
         class HTTPLogMiddleware(BaseHTTPMiddleware):
-            def __init__(self, app, http_logger: HTTPAccessLogger, auth_middleware: Optional[AuthMiddleware] = None):
+            def __init__(
+                self,
+                app,
+                http_logger: HTTPAccessLogger,
+                auth_middleware: Optional[AuthMiddleware] = None,
+                inflight: Optional[InflightTracker] = None,
+            ):
                 super().__init__(app)
                 self.http_logger = http_logger
                 self.auth_middleware = auth_middleware
+                self.inflight = inflight
 
             async def dispatch(
                 self,
@@ -1263,6 +1499,14 @@ class LLMProxy:
                     body=log_body,
                 )
 
+                track = bool(
+                    self.inflight
+                    and method in ("POST", "PUT", "PATCH")
+                    and InflightTracker.is_inference_path(path)
+                )
+                if track and self.inflight is not None:
+                    await self.inflight.enter()
+
                 # Process request
                 try:
                     response = await call_next(request)
@@ -1300,9 +1544,17 @@ class LLMProxy:
                         error=str(e),
                     )
                     raise
+                finally:
+                    if track and self.inflight is not None:
+                        await self.inflight.exit()
 
         # Add middleware to the app
-        fastapi_app.add_middleware(HTTPLogMiddleware, http_logger=self.http_logger, auth_middleware=self.auth_middleware)
+        fastapi_app.add_middleware(
+            HTTPLogMiddleware,
+            http_logger=self.http_logger,
+            auth_middleware=self.auth_middleware,
+            inflight=inflight_tracker,
+        )
         fastapi_app.state.openclaw_http_middleware_installed = True
 
     def _register_status_route(self, fastapi_app: Any) -> None:
@@ -1329,7 +1581,12 @@ class LLMProxy:
             return {
                 "name": "openclaw-tracer",
                 "version": __version__,
-                "features": ["task-tracking", "reward-tracking"],
+                "features": [
+                    "task-tracking",
+                    "reward-tracking",
+                    "no-trace-header",
+                    "flush-api",
+                ],
             }
 
         @fastapi_app.post("/end_task")
@@ -1387,6 +1644,51 @@ class LLMProxy:
                 },
                 status_code=200
             )
+
+        @fastapi_app.post("/flush")
+        async def flush_store(request: Request) -> JSONResponse:
+            """Flush in-memory span buffers to Parquet (requires PROXY_API_KEY).
+
+            Query/body ``trigger_workflow`` (bool, default false): also schedule
+            the buffer-full workflow trigger script after flush.
+            """
+            trigger_workflow = False
+            try:
+                body = await request.json()
+                if isinstance(body, dict) and "trigger_workflow" in body:
+                    raw = body.get("trigger_workflow")
+                    if isinstance(raw, bool):
+                        trigger_workflow = raw
+                    elif isinstance(raw, str):
+                        trigger_workflow = raw.strip().lower() in {
+                            "1",
+                            "true",
+                            "yes",
+                            "on",
+                        }
+                    else:
+                        trigger_workflow = bool(raw)
+            except Exception:
+                pass
+            qp = request.query_params.get("trigger_workflow")
+            if qp is not None:
+                trigger_workflow = qp.strip().lower() in {"1", "true", "yes", "on"}
+
+            if not hasattr(store, "flush"):
+                return JSONResponse(
+                    {"error": "flush not supported for this storage backend"},
+                    status_code=501,
+                )
+
+            if trigger_workflow and isinstance(store, ParquetStore):
+                await store.flush(schedule_workflow=True)
+            else:
+                await store.flush()
+
+            status_payload: Dict[str, Any] = {"ok": True, "trigger_workflow": trigger_workflow}
+            if hasattr(store, "get_collection_status"):
+                status_payload["status"] = store.get_collection_status()
+            return JSONResponse(status_payload, status_code=200)
 
         fastapi_app.state.openclaw_status_route_registered = True
 

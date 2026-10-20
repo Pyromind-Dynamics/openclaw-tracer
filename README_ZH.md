@@ -1,5 +1,7 @@
 # OpenClaw-Tracer
 
+[English](README.md)
+
 <p align="center">
   <img src="img/logo.png" alt="OpenClaw-Tracer Logo" width="220">
 </p>
@@ -16,6 +18,8 @@ OpenClaw-Tracer 是一个基于 LiteLLM 的轻量级 LLM 数据采集与追踪�
 - **实时采集**: 可配置缓冲区，支持立即写入或批量写入
 
 ## 架构
+
+![架构](img/arch.png)
 
 ```
 OpenClaw / Chatbox / 其他客户端 → OpenClaw-Tracer → 上游模型提供商
@@ -113,8 +117,9 @@ docker-compose up -d
 | 变量 | 是否必填 | 说明 |
 |------|----------|------|
 | `PROXY_API_KEY` | **是** | 代理服务的鉴权密钥 |
+| `ADMIN_API_KEY` | 否 | 仅用于 `/admin/routing/**`（热切流 / deployment CRUD），与 `PROXY_API_KEY` 互不通用 |
 
-**重要：** 如果未设置 `PROXY_API_KEY`，服务将无法启动。
+**重要：** 如果未设置 `PROXY_API_KEY`，服务将无法启动。热切流与模型 CRUD 见 [docs/USAGE.md §9](docs/USAGE.md#9-热切流与模型-crud)。
 
 #### 基础配置
 
@@ -286,6 +291,7 @@ docker run -d \
 | `TRAJECTORY_BUFFER_SIZE` | 否 | `0` | 缓冲区最大值，超过后清理旧数据（0 = 禁用） |
 | `TIME_WINDOW_MINUTES` | 否 | `30` | 定时刷盘间隔分钟数 |
 | `PROXY_API_KEY` | 是 | - | 代理鉴权密钥 |
+| `ADMIN_API_KEY` | 否 | - | 仅 `/admin/routing/**` |
 
 **缓冲区行为说明：**
 | 配置 | 行为 |
@@ -381,6 +387,136 @@ curl http://localhost:43886/v1/models
 ### 权限错误
 - 确保 `data/` 和 `logs/` 目录可写
 - 检查 Docker 卷挂载权限
+
+## Task 追踪
+
+OpenClaw-Tracer 支持 task 追踪和奖励信号捕获，用于 RL 训练数据收集。
+
+### 请求头
+
+| 请求头 | 类型 | 必填 | 描述 |
+|--------|------|------|------|
+| `X-Task-ID` | string | 否 | 任务标识符，用作 `rollout_id` |
+| `X-Previous-Reward` | float | 否 | 上一步的奖励值 |
+| `X-Task-No-Trace` | bool | 否 | 为 `1`/`true`/`yes`/`on` 时仍转发上游，但**不落盘** span |
+
+### 示例
+
+```bash
+curl http://localhost:43886/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer your-proxy-key" \
+  -H "X-Task-ID: my-task-123" \
+  -H "X-Previous-Reward: 0.85" \
+  -d '{
+    "model": "gpt-4",
+    "messages": [{"role": "user", "content": "Hello!"}]
+  }'
+```
+
+单次请求不落盘：
+
+```bash
+curl http://localhost:43886/v1/chat/completions \
+  -H "Authorization: Bearer your-proxy-key" \
+  -H "X-Task-No-Trace: true" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"gpt-4","messages":[{"role":"user","content":"ping"}]}'
+```
+
+### API 端点
+
+#### GET /tracer-version
+
+获取 tracer 版本信息（无需认证）。
+
+```bash
+curl http://localhost:43886/tracer-version
+```
+
+#### POST /end_task
+
+结束指定 task 会话。可选传入本轮 **最终 reward**（episode 级别）：优先使用字段 `final_reward`，若省略则用别名 `reward`；二者同时存在时以 `final_reward` 为准。未传入时响应里 `final_reward` 为 `null`。无效数字返回 400。
+
+```bash
+curl -X POST http://localhost:43886/end_task \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer your-proxy-key" \
+  -d '{"task_id": "my-task-123", "final_reward": 1.0}'
+```
+
+#### POST /flush
+
+立即将内存中的 span 缓冲刷入 Parquet（需 `PROXY_API_KEY`）。可选 `trigger_workflow`（query 或 JSON，默认 `false`）同时调度 buffer-full 训练触发脚本。
+
+```bash
+curl -X POST http://localhost:43886/flush \
+  -H "Authorization: Bearer your-proxy-key" \
+  -H "Content-Type: application/json" \
+  -d '{"trigger_workflow": false}'
+```
+
+### 环境变量
+
+| 变量 | 默认值 | 描述 |
+|------|--------|------|
+| `TASK_TIMEOUT_MINUTES` | 10 | task 超时时间（分钟） |
+
+## 回调（Callbacks）
+
+所有回调均为 **异步 / fire-and-forget**（失败只打日志，不影响客户端请求）。
+
+### 1) 训练 workflow 触发（buffer 满 flush 后）
+
+在因 `BUFFER_SIZE` 写满而 flush，或 `POST /flush` 且 `trigger_workflow=true` 时触发。仅因时间窗口切文件的 flush **不会**触发。
+
+| 变量 | 说明 |
+|------|------|
+| `ENABLE_WORKFLOW_TRIGGER` | 默认开启；设为 `0`/`false` 关闭 |
+| `WORKFLOW_TRIGGER_SCRIPT` | shell 脚本路径（见 `workflow_trigger.py`） |
+
+### 2) 路由变更（admin 热切流 / CRUD）
+
+`/admin/routing/**` 成功 `reload_models` 后触发；payload 中 `api_key` 已脱敏。
+
+| 变量 | 说明 |
+|------|------|
+| `ROUTING_CHANGE_CALLBACK_URL` | 可选，异步 HTTP POST JSON |
+| `ROUTING_CHANGE_CALLBACK_TIMEOUT` | HTTP 超时秒（默认 `5`） |
+| `ROUTING_CHANGE_CALLBACK_SCRIPT` | 可选 shell；argv 为 JSON 临时文件路径 |
+| `ROUTING_CHANGE_CALLBACK_SCRIPT_TIMEOUT` | 脚本超时秒（默认 `30`） |
+
+事件：`{"event":"routing.updated","reason":"...","previous":[],"current":[],"op":{...}}`。
+
+### 3) 数据删除（trajectory batch 滚出）
+
+当 `TRAJECTORY_BUFFER_SIZE > 0`，推进 batch 时可能删除旧的 `spans/<n>/`（含该 batch 下的 `media/images/`）。每次成功删除会调度本回调。
+
+内联图片与 spans 同树落盘：非 batch 为 `spans/media/images/...`，batch 为 `spans/<n>/media/images/...`，滚出时 parquet 与图片一并删除。
+
+| 变量 | 说明 |
+|------|------|
+| `DATA_DELETE_CALLBACK_URL` | 可选，异步 HTTP POST JSON |
+| `DATA_DELETE_CALLBACK_TIMEOUT` | HTTP 超时秒（默认 `5`） |
+| `DATA_DELETE_CALLBACK_SCRIPT` | 可选 shell；argv 为 JSON 临时文件路径 |
+| `DATA_DELETE_CALLBACK_SCRIPT_TIMEOUT` | 脚本超时秒（默认 `30`） |
+
+事件示例：
+
+```json
+{
+  "event": "data.deleted",
+  "reason": "batch_advance",
+  "timestamp": "<iso8601>",
+  "paths": ["/app/data/spans/0"],
+  "batch_index": 0,
+  "extra": {
+    "current_batch_index": 3,
+    "buffer_size": 100,
+    "trajectory_buffer_size": 10000
+  }
+}
+```
 
 ## 开发路线 / TODO
 

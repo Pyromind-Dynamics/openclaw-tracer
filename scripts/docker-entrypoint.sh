@@ -41,6 +41,11 @@ echo "  Buffer:     ${BUFFER_SIZE:-100}"
 echo "  Trajectory: ${TRAJECTORY_BUFFER_SIZE:-0}"
 echo "  FlushInterval: ${FLUSH_INTERVAL_SECONDS:-1800}s"
 echo "  Auth:       启用 (PROXY_API_KEY: ${PROXY_API_KEY:0:8}...)"
+if [ -n "${ADMIN_API_KEY}" ]; then
+    echo "  Admin:      启用 (ADMIN_API_KEY set)"
+else
+    echo "  Admin:      未启用 (set ADMIN_API_KEY for /admin/routing)"
+fi
 [ -n "${TARGET_MODEL}" ] && echo "  Model:      ${TARGET_MODEL} -> ${API_MODE:+${API_MODE}/}${ORIGIN_MODEL}"
 echo "=========================================="
 

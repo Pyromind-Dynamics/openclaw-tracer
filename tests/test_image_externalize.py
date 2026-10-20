@@ -35,7 +35,7 @@ def test_data_url_image_written_as_jpeg_and_path_in_messages(tmp_path: Path) -> 
     )
 
     assert out_system is None
-    rel = Path("media") / "images" / trace_id / f"{span_id}_0.jpg"
+    rel = Path("spans") / "media" / "images" / trace_id / f"{span_id}_0.jpg"
     assert (tmp_path / rel).is_file()
 
     url = out_messages[0]["content"][1]["image_url"]["url"]
@@ -59,7 +59,7 @@ def test_https_image_url_unchanged(tmp_path: Path) -> None:
         tmp_path, trace_id, span_id, messages, None
     )
     assert out_messages[0]["content"][0]["image_url"]["url"] == https_url
-    media_dir = tmp_path / "media" / "images" / trace_id
+    media_dir = tmp_path / "spans" / "media" / "images" / trace_id
     assert not media_dir.exists() or not any(media_dir.glob("*.jpg"))
 
 
@@ -75,9 +75,28 @@ def test_system_multimodal_list_gets_externalized(tmp_path: Path) -> None:
         tmp_path, trace_id, span_id, [], system_parts
     )
     assert out_messages == []
-    rel = Path("media") / "images" / trace_id / f"{span_id}_0.jpg"
+    rel = Path("spans") / "media" / "images" / trace_id / f"{span_id}_0.jpg"
     assert (tmp_path / rel).is_file()
     assert out_system[1]["image_url"]["url"] == rel.as_posix()
+
+
+def test_custom_batch_media_prefix(tmp_path: Path) -> None:
+    trace_id = "1" * 32
+    span_id = "2" * 16
+    data_url = f"data:image/png;base64,{_TINY_PNG_B64}"
+    messages = [
+        {
+            "role": "user",
+            "content": [{"type": "image_url", "image_url": {"url": data_url}}],
+        }
+    ]
+    prefix = "spans/3/media/images"
+    out_messages, _ = externalize_inline_images_for_span(
+        tmp_path, trace_id, span_id, messages, None, media_images_prefix=prefix
+    )
+    rel = Path("spans") / "3" / "media" / "images" / trace_id / f"{span_id}_0.jpg"
+    assert (tmp_path / rel).is_file()
+    assert out_messages[0]["content"][0]["image_url"]["url"] == rel.as_posix()
 
 
 def test_redact_log_body_strips_base64_from_messages() -> None:

@@ -407,12 +407,16 @@ class ParquetStore(StorageBackend):
                 logger.info(f"Periodic flush: {len(self._span_buffer)} spans in buffer")
                 await self.flush()
 
-    async def flush(self) -> None:
-        """Flush all buffered data to storage."""
+    async def flush(self, schedule_workflow: bool = False) -> None:
+        """Flush all buffered data to storage.
+
+        Args:
+            schedule_workflow: If True, also fire the buffer-full workflow trigger.
+        """
         current_window = _get_time_window(self.time_window_minutes)
         await self._flush_spans(
             new_window=current_window != self._current_span_window,
-            schedule_workflow=False,
+            schedule_workflow=schedule_workflow,
         )
 
     async def close(self) -> None:
@@ -531,6 +535,19 @@ class ParquetStore(StorageBackend):
             logger.info(f"Scheduling workflow trigger: {self._workflow_trigger_script_path}")
             schedule_workflow_trigger(self._workflow_trigger_script_path)
 
+    def prepare_media_images_prefix(self) -> str:
+        """Return relative media dir for the batch that the next span will join.
+
+        Advances the batch when the current one is already full (same rule as
+        ``add_span``), so inline images land under the same ``spans/<n>/`` tree
+        as the parquet shard and are removed together on batch roll-off.
+        """
+        if self._batch_mode and self._current_batch_collected >= self.buffer_size:
+            self._advance_batch()
+        if self._batch_mode:
+            return f"spans/{self._current_batch_index}/media/images"
+        return "spans/media/images"
+
     def _advance_batch(self) -> None:
         """Advance to the next batch directory and delete old batches if needed.
 
@@ -555,8 +572,31 @@ class ParquetStore(StorageBackend):
         if old_batch >= 0:
             old_batch_dir = self.output_dir / "spans" / str(old_batch)
             if old_batch_dir.exists():
+                deleted_path = str(old_batch_dir)
                 shutil.rmtree(old_batch_dir)
                 logger.info(f"Deleted old batch directory: {old_batch_dir}")
+                try:
+                    from openclaw_tracer.data_callback import (
+                        build_data_delete_event,
+                        schedule_data_delete_callback,
+                    )
+
+                    schedule_data_delete_callback(
+                        build_data_delete_event(
+                            reason="batch_advance",
+                            paths=[deleted_path],
+                            batch_index=old_batch,
+                            extra={
+                                "current_batch_index": self._current_batch_index,
+                                "buffer_size": self.buffer_size,
+                                "trajectory_buffer_size": self.trajectory_buffer_size,
+                            },
+                        )
+                    )
+                except Exception:
+                    logger.exception(
+                        "Failed to schedule data delete callback for %s", deleted_path
+                    )
 
         # Reset time window for the new batch
         self._current_span_window = _get_time_window(self.time_window_minutes)
