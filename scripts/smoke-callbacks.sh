@@ -3,7 +3,7 @@
 #
 # Phase A (always): schedule workflow / routing / data-delete callbacks in-process.
 # Phase B (optional): if SMOKE_BASE_URL is set, hit live APIs:
-#   POST /flush?trigger_workflow=true
+#   POST /admin/flush?trigger_workflow=true
 #   POST /admin/routing/deployments (needs ADMIN_API_KEY)
 #
 # Usage:
@@ -13,7 +13,7 @@
 #
 # Env:
 #   SMOKE_BASE_URL   optional live tracer URL
-#   PROXY_API_KEY    for /flush (default demo-openclaw-proxy-key)
+#   ADMIN_API_KEY    for /admin/flush (required for Phase B flush)
 #   ADMIN_API_KEY    for /admin/routing (optional; skips admin smoke if unset)
 #   SMOKE_KEEP_LOGS=1  keep mock log dir after success
 
@@ -142,48 +142,59 @@ if [[ -n "${SMOKE_BASE_URL}" ]]; then
   command -v curl >/dev/null || die "curl required for Phase B"
   BASE="${SMOKE_BASE_URL%/}"
 
-  # Clear logs so we can see new fires (workflow only via /flush)
+  if [[ -z "${ADMIN_API_KEY}" ]]; then
+    die "Phase B needs ADMIN_API_KEY for /admin/flush"
+  fi
+
+  # Clear logs so we can see new fires (workflow only via /admin/flush)
   : >"${WF_LOG}"
 
   code="$(
     curl -sS -o "${LOG_DIR}/flush.json" -w '%{http_code}' \
-      -X POST "${BASE}/flush" \
-      -H "Authorization: Bearer ${PROXY_API_KEY}" \
+      -X POST "${BASE}/admin/flush" \
+      -H "Authorization: Bearer ${ADMIN_API_KEY}" \
       -H "Content-Type: application/json" \
       -d '{"trigger_workflow": true}' || true
   )"
-  echo "POST /flush → HTTP ${code}"
+  echo "POST /admin/flush → HTTP ${code}"
   cat "${LOG_DIR}/flush.json" 2>/dev/null || true
   echo
-  [[ "${code}" == "200" ]] || die "flush failed (is tracer using same WORKFLOW_TRIGGER_SCRIPT?)"
+  [[ "${code}" == "200" ]] || die "admin flush failed (is tracer using same WORKFLOW_TRIGGER_SCRIPT?)"
 
   # Note: live tracer process must have WORKFLOW_TRIGGER_SCRIPT pointed at our mock
   # for the workflow log to update; if tracer is a separate container, Phase B only
   # checks HTTP 200 unless you mount these mocks into the container.
   sleep 1
   if [[ -s "${WF_LOG}" ]] && grep -q "WORKFLOW_TRIGGER fired" "${WF_LOG}"; then
-    ok "Phase B: flush triggered workflow mock"
+    ok "Phase B: admin flush triggered workflow mock"
   else
-    echo "⚠ Phase B: /flush returned ${code}, but workflow mock log unchanged."
+    echo "⚠ Phase B: /admin/flush returned ${code}, but workflow mock log unchanged."
     echo "  (Expected if tracer runs elsewhere without these mock env mounts.)"
   fi
 
-  if [[ -n "${ADMIN_API_KEY}" ]]; then
-    code="$(
-      curl -sS -o "${LOG_DIR}/admin.json" -w '%{http_code}' \
-        -X GET "${BASE}/admin/routing" \
-        -H "Authorization: Bearer ${ADMIN_API_KEY}" || true
-    )"
-    echo "GET /admin/routing → HTTP ${code}"
-    head -c 400 "${LOG_DIR}/admin.json" 2>/dev/null || true
-    echo
-    [[ "${code}" == "200" ]] || die "admin routing GET failed"
-    ok "Phase B: admin routing reachable"
-  else
-    echo "⚠ ADMIN_API_KEY unset; skip admin routing smoke"
-  fi
+  code="$(
+    curl -sS -o "${LOG_DIR}/admin.json" -w '%{http_code}' \
+      -X GET "${BASE}/admin/routing" \
+      -H "Authorization: Bearer ${ADMIN_API_KEY}" || true
+  )"
+  echo "GET /admin/routing → HTTP ${code}"
+  head -c 400 "${LOG_DIR}/admin.json" 2>/dev/null || true
+  echo
+  [[ "${code}" == "200" ]] || die "admin routing GET failed"
+  ok "Phase B: admin routing reachable"
+
+  code="$(
+    curl -sS -o "${LOG_DIR}/batches.json" -w '%{http_code}' \
+      -X GET "${BASE}/admin/batches" \
+      -H "Authorization: Bearer ${ADMIN_API_KEY}" || true
+  )"
+  echo "GET /admin/batches → HTTP ${code}"
+  head -c 400 "${LOG_DIR}/batches.json" 2>/dev/null || true
+  echo
+  [[ "${code}" == "200" ]] || die "admin batches GET failed"
+  ok "Phase B: admin batches reachable"
 else
-  info "Phase B skipped (set SMOKE_BASE_URL to hit live /flush)"
+  info "Phase B skipped (set SMOKE_BASE_URL + ADMIN_API_KEY to hit live /admin/flush)"
 fi
 
 ok "smoke-callbacks finished"

@@ -138,13 +138,13 @@ Create `config/models.json` with your model configurations:
 | `API_URL` | No | Custom API base URL (overrides default) |
 | `ACCESS_KEY` | Yes | API access key |
 
-#### Batch Mode (Rolling Window)
+#### Batch Mode (Hold Until Training Completes)
 
 | Variable | Required | Description |
 |----------|----------|-------------|
-| `TRAJECTORY_BUFFER_SIZE` | No | Total records to retain (0 = disabled, enables batch mode) |
+| `TRAJECTORY_BUFFER_SIZE` | No | Max records held across ready+collecting batches (0 = disabled / non-batch) |
 
-When `TRAJECTORY_BUFFER_SIZE` is set, data is stored in rolling batches. Old data is automatically deleted when the limit is exceeded.
+When `TRAJECTORY_BUFFER_SIZE > 0`, each full `BUFFER_SIZE` batch is marked **ready**, kept on disk for training, and may trigger `WORKFLOW_TRIGGER`. Ready batches are **not** auto-deleted. After training, call `POST /admin/batches/{id}/release` to remove that batch (fires `DATA_DELETE_CALLBACK`). If all slots are full of unreleased ready batches, new collection pauses (`BatchCapacityFull`) until you release.
 
 **Example using environment variables:**
 
@@ -286,7 +286,7 @@ docker run -d \
 | `API_URL` | Yes | - | Base URL of upstream model API |
 | `ACCESS_KEY` | Yes | - | API key for upstream model |
 | `BUFFER_SIZE` | No | `1` | Buffer size before flushing data (1 = immediate write) |
-| `TRAJECTORY_BUFFER_SIZE` | No | `0` | Max buffer size, old data flushed when exceeded (0 = disabled) |
+| `TRAJECTORY_BUFFER_SIZE` | No | `0` | Max held records (ready+collecting); release after train (0 = non-batch) |
 | `TIME_WINDOW_MINUTES` | No | `30` | Periodic flush interval in minutes |
 | `PROXY_API_KEY` | Yes | - | API key for proxy authentication |
 | `ADMIN_API_KEY` | No | - | Admin key for `/admin/routing/**` only |
@@ -296,9 +296,9 @@ docker run -d \
 |---------------|----------|
 | Both empty (default) | Immediate write mode - safest, no data loss on crash |
 | `BUFFER_SIZE=100`, `TRAJECTORY_BUFFER_SIZE=0` | Write every 100 records, **data accumulates indefinitely** |
-| `BUFFER_SIZE=100`, `TRAJECTORY_BUFFER_SIZE=10000` | Batch mode - keep 100 batches, old data auto-deleted |
+| `BUFFER_SIZE=100`, `TRAJECTORY_BUFFER_SIZE=10000` | Batch mode — up to 100 ready slots held for training; delete only via `/admin/batches/{id}/release` |
 
-**Note:** When `TRAJECTORY_BUFFER_SIZE=0`, old data will never be deleted and will continue to accumulate. Set this value to enable automatic cleanup of old data.
+**Note:** Ready batches are never auto-deleted. Training must call release (or you keep `TRAJECTORY_BUFFER_SIZE=0` and manage disk yourself).
 
 **Important:**
 - You must set `PROXY_API_KEY`, otherwise the container will fail to start
@@ -443,15 +443,27 @@ curl -X POST http://localhost:43886/end_task \
   -d '{"task_id": "my-task-123", "final_reward": 1.0}'
 ```
 
-#### POST /flush
+#### POST /admin/flush
 
-Flush in-memory span buffers to Parquet immediately (`PROXY_API_KEY` required). Optional `trigger_workflow` (query or JSON body, default `false`) also schedules the buffer-full workflow trigger script.
+Flush in-memory span buffers to Parquet immediately (`ADMIN_API_KEY` required). Optional `trigger_workflow` (query or JSON body, default `false`) also schedules the buffer-full workflow trigger script.
 
 ```bash
-curl -X POST http://localhost:43886/flush \
-  -H "Authorization: Bearer your-proxy-key" \
+curl -X POST http://localhost:43886/admin/flush \
+  -H "Authorization: Bearer your-admin-key" \
   -H "Content-Type: application/json" \
   -d '{"trigger_workflow": false}'
+```
+
+#### GET /admin/batches · POST /admin/batches/{id}/release
+
+List held/ready trajectory batches, or release a **ready** batch after training (`ADMIN_API_KEY`). Release deletes `spans/<id>/` (including media) and fires the data-delete callback with `reason=training_complete`.
+
+```bash
+curl http://localhost:43886/admin/batches \
+  -H "Authorization: Bearer your-admin-key"
+
+curl -X POST http://localhost:43886/admin/batches/0/release \
+  -H "Authorization: Bearer your-admin-key"
 ```
 
 ### Environment Variables
@@ -466,7 +478,7 @@ All callbacks are **async / fire-and-forget** (failures are logged only; they do
 
 ### 1) Workflow trigger (after buffer-full flush)
 
-Fired when a flush is caused by the buffer filling (`BUFFER_SIZE`), or when `POST /flush` is called with `trigger_workflow=true`. Time-window-only flushes do **not** trigger this.
+Fired when a flush is caused by the buffer filling (`BUFFER_SIZE`), or when `POST /admin/flush` is called with `trigger_workflow=true`. Time-window-only flushes do **not** trigger this.
 
 | Variable | Description |
 |----------|-------------|
@@ -486,11 +498,9 @@ Fired after a successful `reload_models` from `/admin/routing/**`. Payload keys 
 
 Event shape: `{"event":"routing.updated","reason":"...","previous":[],"current":[],"op":{...}}`.
 
-### 3) Data delete (trajectory batch roll-off)
+### 3) Data delete (after training release)
 
-When `TRAJECTORY_BUFFER_SIZE > 0`, advancing batches may delete old `spans/<n>/` directories (including nested `media/images/` for that batch). Each successful delete schedules this callback.
-
-Inline images are stored under the same tree as spans: `spans/media/images/...` (non-batch) or `spans/<n>/media/images/...` (batch), so roll-off removes parquet and media together.
+When `TRAJECTORY_BUFFER_SIZE > 0`, full batches stay on disk until `POST /admin/batches/{id}/release`. That delete (parquet + nested `media/images/`) schedules this callback with `reason=training_complete`.
 
 | Variable | Description |
 |----------|-------------|
@@ -504,7 +514,7 @@ Event shape:
 ```json
 {
   "event": "data.deleted",
-  "reason": "batch_advance",
+  "reason": "training_complete",
   "timestamp": "<iso8601>",
   "paths": ["/app/data/spans/0"],
   "batch_index": 0,

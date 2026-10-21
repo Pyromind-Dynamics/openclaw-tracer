@@ -59,9 +59,12 @@ async def test_flush_accepts_schedule_workflow(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_batch_delete_schedules_callback(
+async def test_full_batch_held_until_release(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """Full batches stay on disk until admin release; no auto-delete on advance."""
+    from openclaw_tracer.storage.parquet_store import BatchCapacityFull
+
     monkeypatch.setenv("DATA_DELETE_CALLBACK_URL", "http://callback.test/del")
     monkeypatch.delenv("DATA_DELETE_CALLBACK_SCRIPT", raising=False)
 
@@ -73,7 +76,7 @@ async def test_batch_delete_schedules_callback(
     store = ParquetStore(
         output_dir=tmp_path / "data",
         buffer_size=2,
-        trajectory_buffer_size=4,
+        trajectory_buffer_size=4,  # max 2 batch slots
         time_window_minutes=9999,
         enable_workflow_trigger=False,
     )
@@ -91,17 +94,33 @@ async def test_batch_delete_schedules_callback(
             sequence_id=i,
         )
 
+    # Fill 2 batches (4 spans) — both held as ready / collecting, no delete
+    for i in range(4):
+        await store.add_span(make_span(i))
+
+    assert (tmp_path / "data" / "spans" / "0").is_dir()
+    assert (tmp_path / "data" / "spans" / "1").is_dir()
+    assert not scheduled
+
+    inventory = store.list_batches()
+    assert inventory["ready_count"] >= 1
+    assert any(b["index"] == 0 and b["state"] == "ready" for b in inventory["batches"])
+
+    # Third batch would need a new slot → capacity full
+    with pytest.raises(BatchCapacityFull):
+        await store.add_span(make_span(99))
+
     with patch(
         "openclaw_tracer.data_callback.schedule_data_delete_callback", capture
     ):
-        # Fill batches until an old one is deleted:
-        # max_batches = 4//2 = 2; delete when current_batch_index - 2 - 1 >= 0
-        # advance at 2,4,6 → at advance to batch 3, delete batch 0
-        for i in range(8):
-            await store.add_span(make_span(i))
+        result = await store.release_batch(0)
 
-    assert any(p.get("event") == "data.deleted" for p in scheduled), scheduled
-    assert any(p.get("reason") == "batch_advance" for p in scheduled)
+    assert result["released_batch_index"] == 0
+    assert any(p.get("reason") == "training_complete" for p in scheduled), scheduled
+    assert not (tmp_path / "data" / "spans" / "0").exists()
+
+    # After release, a free slot exists so collection can continue
+    await store.add_span(make_span(100))
     await store.close()
 
 
@@ -127,6 +146,6 @@ async def test_schedule_data_delete_skipped_when_unset(
     monkeypatch.delenv("DATA_DELETE_CALLBACK_SCRIPT", raising=False)
     with patch("openclaw_tracer.data_callback.asyncio.get_running_loop") as loop:
         schedule_data_delete_callback(
-            build_data_delete_event(reason="batch_advance", paths=["/tmp/x"], batch_index=0)
+            build_data_delete_event(reason="training_complete", paths=["/tmp/x"], batch_index=0)
         )
         loop.assert_not_called()

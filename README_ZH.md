@@ -144,9 +144,9 @@ docker-compose up -d
 
 | 变量 | 是否必填 | 说明 |
 |------|----------|------|
-| `TRAJECTORY_BUFFER_SIZE` | 否 | 保留的总记录数 (0 = 禁用，启用批处理模式) |
+| `TRAJECTORY_BUFFER_SIZE` | 否 | 可占用的最大记录数（ready+collecting；0 = 禁用 batch） |
 
-当设置 `TRAJECTORY_BUFFER_SIZE` 时，数据将以滚动批次方式存储。超过限制时，旧数据会自动删除。
+当 `TRAJECTORY_BUFFER_SIZE > 0` 时，每凑满一个 `BUFFER_SIZE` 的 batch 会标记为 **ready** 并保留在磁盘上供训练（可触发 `WORKFLOW_TRIGGER`），**不会自动删除**。训练结束后调用 `POST /admin/batches/{id}/release` 才会删除该批（并触发 `DATA_DELETE_CALLBACK`）。若所有槽位都被未释放的 ready batch 占满，采集会暂停（`BatchCapacityFull`），直到 release。
 
 **使用环境变量示例：**
 
@@ -288,7 +288,7 @@ docker run -d \
 | `API_URL` | 是 | - | 上游模型的 API 基础 URL |
 | `ACCESS_KEY` | 是 | - | 上游模型的 API 密钥 |
 | `BUFFER_SIZE` | 否 | `1` | 刷盘前的缓冲区大小（1 = 立即写入） |
-| `TRAJECTORY_BUFFER_SIZE` | 否 | `0` | 缓冲区最大值，超过后清理旧数据（0 = 禁用） |
+| `TRAJECTORY_BUFFER_SIZE` | 否 | `0` | 可占用的最大记录数（ready+collecting）；训完后 release（0 = 非 batch） |
 | `TIME_WINDOW_MINUTES` | 否 | `30` | 定时刷盘间隔分钟数 |
 | `PROXY_API_KEY` | 是 | - | 代理鉴权密钥 |
 | `ADMIN_API_KEY` | 否 | - | 仅 `/admin/routing/**` |
@@ -298,9 +298,9 @@ docker run -d \
 |------|------|
 | 两者都为空（默认） | 立即写入模式 - 最安全，崩溃不丢失数据 |
 | `BUFFER_SIZE=100`, `TRAJECTORY_BUFFER_SIZE=0` | 每 100 条记录写入一次，**数据持续累积不清理** |
-| `BUFFER_SIZE=100`, `TRAJECTORY_BUFFER_SIZE=10000` | 批处理模式 - 保留 100 批，自动清理旧数据 |
+| `BUFFER_SIZE=100`, `TRAJECTORY_BUFFER_SIZE=10000` | 批处理模式 — 最多约 100 个 ready 槽位供训练；仅 `/admin/batches/{id}/release` 删除 |
 
-**注意：** 当 `TRAJECTORY_BUFFER_SIZE=0` 时，旧数据永远不会被删除，会持续累积。如需自动清理旧数据，请设置此值。
+**注意：** ready batch **不会**自动删除；训练侧必须 release（或保持 `TRAJECTORY_BUFFER_SIZE=0` 自行管磁盘）。
 
 **重要提示：**
 - 必须设置 `PROXY_API_KEY`，否则容器将无法启动
@@ -445,15 +445,27 @@ curl -X POST http://localhost:43886/end_task \
   -d '{"task_id": "my-task-123", "final_reward": 1.0}'
 ```
 
-#### POST /flush
+#### POST /admin/flush
 
-立即将内存中的 span 缓冲刷入 Parquet（需 `PROXY_API_KEY`）。可选 `trigger_workflow`（query 或 JSON，默认 `false`）同时调度 buffer-full 训练触发脚本。
+立即将内存中的 span 缓冲刷入 Parquet（需 `ADMIN_API_KEY`）。可选 `trigger_workflow`（query 或 JSON，默认 `false`）同时调度 buffer-full 训练触发脚本。
 
 ```bash
-curl -X POST http://localhost:43886/flush \
-  -H "Authorization: Bearer your-proxy-key" \
+curl -X POST http://localhost:43886/admin/flush \
+  -H "Authorization: Bearer your-admin-key" \
   -H "Content-Type: application/json" \
   -d '{"trigger_workflow": false}'
+```
+
+#### GET /admin/batches · POST /admin/batches/{id}/release
+
+列出 held/ready 的 trajectory batch，或在训练完成后释放某个 **ready** batch（需 `ADMIN_API_KEY`）。release 会删除 `spans/<id>/`（含 media），并以 `reason=training_complete` 触发数据删除回调。
+
+```bash
+curl http://localhost:43886/admin/batches \
+  -H "Authorization: Bearer your-admin-key"
+
+curl -X POST http://localhost:43886/admin/batches/0/release \
+  -H "Authorization: Bearer your-admin-key"
 ```
 
 ### 环境变量
@@ -468,7 +480,7 @@ curl -X POST http://localhost:43886/flush \
 
 ### 1) 训练 workflow 触发（buffer 满 flush 后）
 
-在因 `BUFFER_SIZE` 写满而 flush，或 `POST /flush` 且 `trigger_workflow=true` 时触发。仅因时间窗口切文件的 flush **不会**触发。
+在因 `BUFFER_SIZE` 写满而 flush，或 `POST /admin/flush` 且 `trigger_workflow=true` 时触发。仅因时间窗口切文件的 flush **不会**触发。
 
 | 变量 | 说明 |
 |------|------|
@@ -488,11 +500,9 @@ curl -X POST http://localhost:43886/flush \
 
 事件：`{"event":"routing.updated","reason":"...","previous":[],"current":[],"op":{...}}`。
 
-### 3) 数据删除（trajectory batch 滚出）
+### 3) 数据删除（训练完成后 release）
 
-当 `TRAJECTORY_BUFFER_SIZE > 0`，推进 batch 时可能删除旧的 `spans/<n>/`（含该 batch 下的 `media/images/`）。每次成功删除会调度本回调。
-
-内联图片与 spans 同树落盘：非 batch 为 `spans/media/images/...`，batch 为 `spans/<n>/media/images/...`，滚出时 parquet 与图片一并删除。
+当 `TRAJECTORY_BUFFER_SIZE > 0`，满 batch 会一直保留，直到 `POST /admin/batches/{id}/release`。删除（parquet + 嵌套 `media/images/`）后以 `reason=training_complete` 调度本回调。
 
 | 变量 | 说明 |
 |------|------|
@@ -506,7 +516,7 @@ curl -X POST http://localhost:43886/flush \
 ```json
 {
   "event": "data.deleted",
-  "reason": "batch_advance",
+  "reason": "training_complete",
   "timestamp": "<iso8601>",
   "paths": ["/app/data/spans/0"],
   "batch_index": 0,

@@ -1228,10 +1228,12 @@ class LLMProxy:
         # Register /status endpoint for collection progress
         self._register_status_route(app)
 
-        # Admin routing CRUD
+        # Admin routing CRUD + flush / batch release
+        from openclaw_tracer.admin_ops import register_admin_ops_routes
         from openclaw_tracer.routing_admin import register_routing_admin_routes
 
         register_routing_admin_routes(app, self)
+        register_admin_ops_routes(app, self)
 
         self._app = app
 
@@ -1645,50 +1647,7 @@ class LLMProxy:
                 status_code=200
             )
 
-        @fastapi_app.post("/flush")
-        async def flush_store(request: Request) -> JSONResponse:
-            """Flush in-memory span buffers to Parquet (requires PROXY_API_KEY).
-
-            Query/body ``trigger_workflow`` (bool, default false): also schedule
-            the buffer-full workflow trigger script after flush.
-            """
-            trigger_workflow = False
-            try:
-                body = await request.json()
-                if isinstance(body, dict) and "trigger_workflow" in body:
-                    raw = body.get("trigger_workflow")
-                    if isinstance(raw, bool):
-                        trigger_workflow = raw
-                    elif isinstance(raw, str):
-                        trigger_workflow = raw.strip().lower() in {
-                            "1",
-                            "true",
-                            "yes",
-                            "on",
-                        }
-                    else:
-                        trigger_workflow = bool(raw)
-            except Exception:
-                pass
-            qp = request.query_params.get("trigger_workflow")
-            if qp is not None:
-                trigger_workflow = qp.strip().lower() in {"1", "true", "yes", "on"}
-
-            if not hasattr(store, "flush"):
-                return JSONResponse(
-                    {"error": "flush not supported for this storage backend"},
-                    status_code=501,
-                )
-
-            if trigger_workflow and isinstance(store, ParquetStore):
-                await store.flush(schedule_workflow=True)
-            else:
-                await store.flush()
-
-            status_payload: Dict[str, Any] = {"ok": True, "trigger_workflow": trigger_workflow}
-            if hasattr(store, "get_collection_status"):
-                status_payload["status"] = store.get_collection_status()
-            return JSONResponse(status_payload, status_code=200)
+        # NOTE: POST /flush moved to POST /admin/flush (ADMIN_API_KEY); see admin_ops.py
 
         fastapi_app.state.openclaw_status_route_registered = True
 

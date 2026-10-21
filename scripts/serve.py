@@ -218,8 +218,11 @@ async def main(
     print(f"  Output:     {output_dir}")
     print(f"  Buffer:     {buffer_size} (每 {buffer_size} 条记录刷新)")
     if trajectory_buffer_size > 0:
-        print(f"  Trajectory: {trajectory_buffer_size} (滚动保留条数)")
-        print(f"  Batch Mode: 启用 (每批 {buffer_size} 条，保留 {trajectory_buffer_size // buffer_size} 个批次)")
+        print(f"  Trajectory: {trajectory_buffer_size} (held until /admin/batches/{{id}}/release)")
+        print(
+            f"  Batch Mode: on ({buffer_size}/batch, "
+            f"max {trajectory_buffer_size // buffer_size} slots; no auto-delete)"
+        )
     print(f"  Time Window: {time_window_minutes} 分钟")
     print(f"  Flush间隔:  {flush_interval_seconds}s ({flush_interval_seconds // 60}min)")
     print(f"  Auth:       启用 (PROXY_API_KEY)")

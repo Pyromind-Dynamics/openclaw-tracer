@@ -28,6 +28,12 @@ from openclaw_tracer.workflow_trigger import (
 
 logger = logging.getLogger(__name__)
 
+BATCH_META_FILENAME = "batch.json"
+
+
+class BatchCapacityFull(Exception):
+    """Ready batches fill TRAJECTORY_BUFFER_SIZE; release trained batches first."""
+
 
 # PyArrow schema for span data with explicit types
 _SPAN_SCHEMA = pa.schema([
@@ -132,7 +138,8 @@ class ParquetStore(StorageBackend):
             buffer_size: Number of records to buffer before auto-flushing (default: 1).
             auto_flush: Whether to automatically flush when buffer is full.
             time_window_minutes: Minutes per time shard (default: 5).
-            trajectory_buffer_size: Total records to retain (rolling window). 0 = disabled.
+            trajectory_buffer_size: Max records held across ready+collecting batches (0 = disabled).
+                Full batches stay on disk until released via admin after training.
             flush_interval_seconds: Periodic flush interval in seconds (default: 1800 = 30min).
                                     0 = disabled.
             enable_workflow_trigger: If set, enables/disables post-flush workflow hook; if None,
@@ -159,6 +166,15 @@ class ParquetStore(StorageBackend):
 
         if self._batch_mode:
             self._restore_batch_state(spans_dir)
+            self._write_batch_meta(
+                self._current_batch_index,
+                state=(
+                    "ready"
+                    if self._current_batch_collected >= self.buffer_size
+                    else "collecting"
+                ),
+                collected=self._current_batch_collected,
+            )
         else:
             # Non-batch mode: spans written directly to data/spans/
             pass
@@ -285,11 +301,16 @@ class ParquetStore(StorageBackend):
         (spans_dir / str(self._current_batch_index)).mkdir(exist_ok=True)
 
     async def add_span(self, span: Span) -> None:
-        """Add a single span to storage."""
-        # In batch mode, advance to next batch BEFORE adding new data
-        # This ensures deletion happens when a new record arrives, not when
-        # the previous batch fills — keeping max_batches complete + 1 in-progress
+        """Add a single span to storage.
+
+        In batch mode a full batch is marked ``ready`` (held for training) and a
+        new collecting batch is opened. Ready batches are never auto-deleted;
+        call ``release_batch`` after training. If all TRAJECTORY_BUFFER_SIZE
+        slots are occupied by unreleased batches, raises ``BatchCapacityFull``.
+        """
+        # Current batch already full → hold it for training, open a new slot
         if self._batch_mode and self._current_batch_collected >= self.buffer_size:
+            self._mark_batch_ready(self._current_batch_index)
             self._advance_batch()
 
         span_dict = self._span_to_dict(span)
@@ -298,6 +319,15 @@ class ParquetStore(StorageBackend):
 
         if self._batch_mode:
             self._current_batch_collected += 1
+            self._write_batch_meta(
+                self._current_batch_index,
+                state=(
+                    "ready"
+                    if self._current_batch_collected >= self.buffer_size
+                    else "collecting"
+                ),
+                collected=self._current_batch_collected,
+            )
 
         # Check if we need to flush (buffer full, time window changed, or batch ready)
         current_window = _get_time_window(self.time_window_minutes)
@@ -315,6 +345,8 @@ class ParquetStore(StorageBackend):
                 new_window=current_window != self._current_span_window,
                 schedule_workflow=schedule_workflow,
             )
+            if batch_ready:
+                self._mark_batch_ready(self._current_batch_index)
 
     async def add_spans(self, spans: List[Span]) -> None:
         """Add multiple spans to storage."""
@@ -538,81 +570,242 @@ class ParquetStore(StorageBackend):
     def prepare_media_images_prefix(self) -> str:
         """Return relative media dir for the batch that the next span will join.
 
-        Advances the batch when the current one is already full (same rule as
-        ``add_span``), so inline images land under the same ``spans/<n>/`` tree
-        as the parquet shard and are removed together on batch roll-off.
+        Advances when the current batch is already full (same rule as ``add_span``),
+        so inline images land under the same ``spans/<n>/`` tree as the parquet
+        shard. Full batches are held until ``release_batch`` after training.
         """
         if self._batch_mode and self._current_batch_collected >= self.buffer_size:
-            self._advance_batch()
+            self._mark_batch_ready(self._current_batch_index)
+            try:
+                self._advance_batch()
+            except BatchCapacityFull:
+                # Stay on the held ready batch; add_span will raise the same error
+                return f"spans/{self._current_batch_index}/media/images"
         if self._batch_mode:
             return f"spans/{self._current_batch_index}/media/images"
         return "spans/media/images"
 
-    def _advance_batch(self) -> None:
-        """Advance to the next batch directory and delete old batches if needed.
+    def _max_batch_slots(self) -> int:
+        if self.buffer_size <= 0:
+            return 0
+        return max(1, self.trajectory_buffer_size // self.buffer_size)
 
-        Retains max_batches complete batches + the current in-progress batch.
-        For BUFFER_SIZE=2, TRAJECTORY_BUFFER_SIZE=4 (max_batches=2):
-          batch 2 advance → batch 3: delete 3-2-1=0 → delete batch 0
-          batch 3 advance → batch 4: delete 4-2-1=1 → delete batch 1
+    def _batch_dir(self, batch_index: int) -> Path:
+        return self.output_dir / "spans" / str(batch_index)
+
+    def _batch_meta_path(self, batch_index: int) -> Path:
+        return self._batch_dir(batch_index) / BATCH_META_FILENAME
+
+    def _list_batch_indices(self) -> List[int]:
+        spans_dir = self.output_dir / "spans"
+        if not spans_dir.exists():
+            return []
+        return sorted(
+            int(d.name) for d in spans_dir.iterdir() if d.is_dir() and d.name.isdigit()
+        )
+
+    def _read_batch_meta(self, batch_index: int) -> Dict[str, Any]:
+        path = self._batch_meta_path(batch_index)
+        if path.is_file():
+            try:
+                data = json.loads(path.read_text(encoding="utf-8"))
+                if isinstance(data, dict):
+                    return data
+            except Exception:
+                logger.exception("Failed to read batch meta %s", path)
+        # Infer from live counters / fullness
+        batch_dir = self._batch_dir(batch_index)
+        collected = 0
+        if batch_dir.is_dir():
+            for pf in batch_dir.glob("*.parquet"):
+                try:
+                    collected += pq.read_table(pf).num_rows
+                except Exception:
+                    continue
+        if batch_index == self._current_batch_index:
+            collected = max(collected, self._current_batch_collected)
+        state = "ready" if collected >= self.buffer_size else "collecting"
+        return {
+            "index": batch_index,
+            "state": state,
+            "collected": collected,
+            "buffer_size": self.buffer_size,
+        }
+
+    def _write_batch_meta(
+        self,
+        batch_index: int,
+        *,
+        state: str,
+        collected: Optional[int] = None,
+        extra: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        if not self._batch_mode:
+            return
+        batch_dir = self._batch_dir(batch_index)
+        batch_dir.mkdir(parents=True, exist_ok=True)
+        payload: Dict[str, Any] = {
+            "index": batch_index,
+            "state": state,
+            "collected": (
+                self._current_batch_collected
+                if collected is None and batch_index == self._current_batch_index
+                else (collected if collected is not None else 0)
+            ),
+            "buffer_size": self.buffer_size,
+            "updated_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+        }
+        if extra:
+            payload.update(extra)
+        path = self._batch_meta_path(batch_index)
+        path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    def _mark_batch_ready(self, batch_index: int) -> None:
+        meta = self._read_batch_meta(batch_index)
+        if meta.get("state") == "ready":
+            return
+        ready_at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+        self._write_batch_meta(
+            batch_index,
+            state="ready",
+            collected=int(meta.get("collected") or self.buffer_size),
+            extra={"ready_at": ready_at},
+        )
+        logger.info("Batch %s marked ready (held for training)", batch_index)
+
+    def _advance_batch(self) -> None:
+        """Open the next collecting batch. Never deletes ready batches.
+
+        Raises:
+            BatchCapacityFull: if TRAJECTORY_BUFFER_SIZE slots are all occupied
+                by unreleased batches.
         """
-        # Flush any remaining data before advancing
-        # (handled by caller or auto-flush, but ensure buffer is clean)
+        occupied = len(self._list_batch_indices())
+        # Current full batch already occupies a slot; opening another needs room
+        if occupied >= self._max_batch_slots():
+            raise BatchCapacityFull(
+                f"trajectory buffer full: {occupied}/{self._max_batch_slots()} batch "
+                f"slots held for training; POST /admin/batches/{{id}}/release after train"
+            )
 
         self._current_batch_index += 1
         self._current_batch_collected = 0
 
-        # Create new batch directory
-        new_batch_dir = self.output_dir / "spans" / str(self._current_batch_index)
+        new_batch_dir = self._batch_dir(self._current_batch_index)
         new_batch_dir.mkdir(parents=True, exist_ok=True)
+        self._write_batch_meta(
+            self._current_batch_index,
+            state="collecting",
+            collected=0,
+        )
 
-        # Rolling deletion: keep max_batches complete batches + current in-progress
-        max_batches = self.trajectory_buffer_size // self.buffer_size
-        old_batch = self._current_batch_index - max_batches - 1
-        if old_batch >= 0:
-            old_batch_dir = self.output_dir / "spans" / str(old_batch)
-            if old_batch_dir.exists():
-                deleted_path = str(old_batch_dir)
-                shutil.rmtree(old_batch_dir)
-                logger.info(f"Deleted old batch directory: {old_batch_dir}")
-                try:
-                    from openclaw_tracer.data_callback import (
-                        build_data_delete_event,
-                        schedule_data_delete_callback,
-                    )
-
-                    schedule_data_delete_callback(
-                        build_data_delete_event(
-                            reason="batch_advance",
-                            paths=[deleted_path],
-                            batch_index=old_batch,
-                            extra={
-                                "current_batch_index": self._current_batch_index,
-                                "buffer_size": self.buffer_size,
-                                "trajectory_buffer_size": self.trajectory_buffer_size,
-                            },
-                        )
-                    )
-                except Exception:
-                    logger.exception(
-                        "Failed to schedule data delete callback for %s", deleted_path
-                    )
-
-        # Reset time window for the new batch
         self._current_span_window = _get_time_window(self.time_window_minutes)
+        logger.info(f"Advanced to batch {self._current_batch_index} (held ready batches retained)")
 
-        logger.info(f"Advanced to batch {self._current_batch_index}")
+    def list_batches(self) -> Dict[str, Any]:
+        """Return ready/collecting batch inventory for admin APIs."""
+        batches = [self._read_batch_meta(i) for i in self._list_batch_indices()]
+        ready = [b for b in batches if b.get("state") == "ready"]
+        return {
+            "batch_mode": self._batch_mode,
+            "buffer_size": self.buffer_size,
+            "trajectory_buffer_size": self.trajectory_buffer_size,
+            "max_batch_slots": self._max_batch_slots() if self._batch_mode else None,
+            "current_batch_index": self._current_batch_index,
+            "current_batch_collected": self._current_batch_collected,
+            "ready_count": len(ready),
+            "batches": batches,
+        }
+
+    async def release_batch(self, batch_index: int) -> Dict[str, Any]:
+        """Delete a ready batch after training completes; fire data-delete callback.
+
+        Raises:
+            FileNotFoundError: batch directory missing
+            ValueError: batch is still collecting (not ready for release)
+        """
+        if not self._batch_mode:
+            raise ValueError("batch release requires TRAJECTORY_BUFFER_SIZE > 0")
+
+        batch_dir = self._batch_dir(batch_index)
+        if not batch_dir.exists():
+            raise FileNotFoundError(f"batch {batch_index} not found")
+
+        meta = self._read_batch_meta(batch_index)
+        state = str(meta.get("state") or "collecting")
+        if state != "ready":
+            raise ValueError(
+                f"batch {batch_index} is '{state}'; only ready batches can be released "
+                f"after training"
+            )
+
+        # Flush any buffered rows that still belong to this batch before delete
+        if batch_index == self._current_batch_index and self._span_buffer:
+            await self._flush_spans(schedule_workflow=False)
+
+        deleted_path = str(batch_dir.resolve())
+        shutil.rmtree(batch_dir)
+        logger.info("Released (deleted) trained batch %s at %s", batch_index, deleted_path)
+
+        # If we released the current index, reopen it as empty collecting
+        if batch_index == self._current_batch_index:
+            self._current_batch_collected = 0
+            batch_dir.mkdir(parents=True, exist_ok=True)
+            self._write_batch_meta(batch_index, state="collecting", collected=0)
+            self._current_span_window = _get_time_window(self.time_window_minutes)
+
+        try:
+            from openclaw_tracer.data_callback import (
+                build_data_delete_event,
+                schedule_data_delete_callback,
+            )
+
+            schedule_data_delete_callback(
+                build_data_delete_event(
+                    reason="training_complete",
+                    paths=[deleted_path],
+                    batch_index=batch_index,
+                    extra={
+                        "current_batch_index": self._current_batch_index,
+                        "buffer_size": self.buffer_size,
+                        "trajectory_buffer_size": self.trajectory_buffer_size,
+                    },
+                )
+            )
+        except Exception:
+            logger.exception(
+                "Failed to schedule data delete callback for released batch %s",
+                batch_index,
+            )
+
+        return {
+            "released_batch_index": batch_index,
+            "deleted_path": deleted_path,
+            "status": self.get_collection_status(),
+        }
 
     def get_collection_status(self) -> Dict[str, Any]:
-        """Return collection progress status."""
-        total = self._current_batch_index * self.buffer_size + self._current_batch_collected
+        """Return collection progress and held-batch summary."""
         if self._batch_mode:
-            total_data_size = min(total, self.trajectory_buffer_size)
-        else:
-            total_data_size = total
+            batches_info = self.list_batches()
+            held_records = sum(
+                int(b.get("collected") or 0) for b in batches_info["batches"]
+            )
+            return {
+                "collected_data_size": self._current_batch_collected,
+                "total_data_size": held_records,
+                "batch_mode": True,
+                "current_batch_index": self._current_batch_index,
+                "ready_count": batches_info["ready_count"],
+                "max_batch_slots": batches_info["max_batch_slots"],
+                "trajectory_buffer_size": self.trajectory_buffer_size,
+            }
+        total = self._current_batch_collected
+        # non-batch: approximate from stats
         return {
-            "collected_data_size": self._current_batch_collected,
-            "total_data_size": total_data_size,
+            "collected_data_size": len(self._span_buffer),
+            "total_data_size": self._stats.get("spans_flushed", 0) + len(self._span_buffer),
+            "batch_mode": False,
         }
 
     def _span_to_dict(self, span: Span) -> Dict[str, Any]:

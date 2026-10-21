@@ -62,3 +62,4 @@ config/models_aitv.json
 
 run.sh
 test.sh
+uv.lock
