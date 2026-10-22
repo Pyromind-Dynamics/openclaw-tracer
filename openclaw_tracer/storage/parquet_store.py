@@ -184,6 +184,12 @@ class ParquetStore(StorageBackend):
 
         # Span buffer
         self._span_buffer: List[Dict[str, Any]] = []
+        # /end_task may arrive before the LLM success callback writes the span.
+        # Stash reward/gt keyed by rollout_id and apply when the span lands.
+        self._pending_final_reward: Dict[str, float] = {}
+        self._pending_gt: Dict[str, str] = {}
+        # Serialize parquet rewrites from concurrent /end_task calls.
+        self._rollout_rewrite_lock = asyncio.Lock()
 
         # Periodic flush
         self.flush_interval_seconds = flush_interval_seconds
@@ -237,7 +243,9 @@ class ParquetStore(StorageBackend):
             return False
         df.loc[mask, "final_reward"] = value
         table = pa.Table.from_pandas(df, schema=_SPAN_SCHEMA, preserve_index=False)
-        pq.write_table(table, path)
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        pq.write_table(table, tmp)
+        tmp.replace(path)
         return True
 
     async def apply_rollout_final_reward(
@@ -246,19 +254,32 @@ class ParquetStore(StorageBackend):
         """Set ``final_reward`` on all spans for ``rollout_id`` (buffer + flushed Parquet shards)."""
         value = float("nan") if final_reward is None else float(final_reward)
 
-        buffer_updates = 0
-        for row in self._span_buffer:
-            if row.get("rollout_id") == rollout_id:
-                row["final_reward"] = value
-                buffer_updates += 1
+        async with self._rollout_rewrite_lock:
+            buffer_updates = 0
+            for row in self._span_buffer:
+                if row.get("rollout_id") == rollout_id:
+                    row["final_reward"] = value
+                    buffer_updates += 1
 
-        file_updates = 0
-        for path in self._iter_span_parquet_paths():
-            changed = await asyncio.to_thread(
-                self._rewrite_parquet_final_reward_for_rollout, path, rollout_id, value
-            )
-            if changed:
-                file_updates += 1
+            file_updates = 0
+            for path in self._iter_span_parquet_paths():
+                changed = await asyncio.to_thread(
+                    self._rewrite_parquet_final_reward_for_rollout,
+                    path,
+                    rollout_id,
+                    value,
+                )
+                if changed:
+                    file_updates += 1
+
+            if buffer_updates == 0 and file_updates == 0 and final_reward is not None:
+                self._pending_final_reward[str(rollout_id)] = float(final_reward)
+                logger.info(
+                    "[ParquetStore] pending final_reward rollout_id=%s (span not written yet)",
+                    rollout_id,
+                )
+            elif str(rollout_id) in self._pending_final_reward:
+                self._pending_final_reward.pop(str(rollout_id), None)
 
         logger.info(
             "[ParquetStore] apply_rollout_final_reward rollout_id=%s buffer_rows=%s parquet_files=%s",
@@ -266,6 +287,103 @@ class ParquetStore(StorageBackend):
             buffer_updates,
             file_updates,
         )
+
+    @staticmethod
+    def _merge_gt_into_attributes(raw_attrs: Any, gt: str) -> str:
+        """Merge ground-truth text into span ``attributes`` JSON under ``gt`` / ``task.gt``."""
+        attrs: Dict[str, Any]
+        if isinstance(raw_attrs, dict):
+            attrs = dict(raw_attrs)
+        elif isinstance(raw_attrs, str) and raw_attrs.strip():
+            try:
+                parsed = json.loads(raw_attrs)
+                attrs = parsed if isinstance(parsed, dict) else {}
+            except json.JSONDecodeError:
+                attrs = {}
+        else:
+            attrs = {}
+        attrs["gt"] = gt
+        attrs["task.gt"] = gt
+        return json.dumps(attrs, ensure_ascii=False)
+
+    def _rewrite_parquet_gt_for_rollout(
+        self, path: Path, rollout_id: str, gt: str
+    ) -> bool:
+        """Merge ``gt`` into ``attributes`` for all rows with ``rollout_id``."""
+        try:
+            df = pq.read_table(path).to_pandas()
+        except Exception as exc:
+            logger.warning("Skipping parquet %s: %s", path, exc)
+            return False
+        if "rollout_id" not in df.columns or "attributes" not in df.columns:
+            return False
+        mask = df["rollout_id"].astype(str) == str(rollout_id)
+        if not mask.any():
+            return False
+        df.loc[mask, "attributes"] = df.loc[mask, "attributes"].map(
+            lambda raw: self._merge_gt_into_attributes(raw, gt)
+        )
+        table = pa.Table.from_pandas(df, schema=_SPAN_SCHEMA, preserve_index=False)
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        pq.write_table(table, tmp)
+        tmp.replace(path)
+        return True
+
+    async def apply_rollout_gt(self, rollout_id: str, gt: str) -> None:
+        """Persist ground-truth text onto all spans for ``rollout_id``.
+
+        Reward headers alone are not enough for SFT/GRPO export — clients should
+        POST ``gt`` (or ``ground_truth``) on ``/end_task`` so exporters can rebuild
+        ``sft_daily`` samples without joining an external source jsonl.
+        """
+        text = str(gt)
+        async with self._rollout_rewrite_lock:
+            buffer_updates = 0
+            for row in self._span_buffer:
+                if row.get("rollout_id") == rollout_id:
+                    row["attributes"] = self._merge_gt_into_attributes(
+                        row.get("attributes"), text
+                    )
+                    buffer_updates += 1
+
+            file_updates = 0
+            for path in self._iter_span_parquet_paths():
+                changed = await asyncio.to_thread(
+                    self._rewrite_parquet_gt_for_rollout, path, rollout_id, text
+                )
+                if changed:
+                    file_updates += 1
+
+            if buffer_updates == 0 and file_updates == 0:
+                self._pending_gt[str(rollout_id)] = text
+                logger.info(
+                    "[ParquetStore] pending gt rollout_id=%s chars=%s (span not written yet)",
+                    rollout_id,
+                    len(text),
+                )
+            elif str(rollout_id) in self._pending_gt:
+                self._pending_gt.pop(str(rollout_id), None)
+
+        logger.info(
+            "[ParquetStore] apply_rollout_gt rollout_id=%s chars=%s buffer_rows=%s parquet_files=%s",
+            rollout_id,
+            len(text),
+            buffer_updates,
+            file_updates,
+        )
+
+    def _apply_pending_to_span_dict(self, span_dict: Dict[str, Any]) -> None:
+        """Merge any pending /end_task reward or gt into a just-buffered span row."""
+        rid = str(span_dict.get("rollout_id") or "")
+        if not rid:
+            return
+        if rid in self._pending_final_reward:
+            span_dict["final_reward"] = self._pending_final_reward.pop(rid)
+        if rid in self._pending_gt:
+            gt = self._pending_gt.pop(rid)
+            span_dict["attributes"] = self._merge_gt_into_attributes(
+                span_dict.get("attributes"), gt
+            )
 
     def _restore_batch_state(self, spans_dir: Path) -> None:
         """Restore batch index and collected count from existing directories on restart."""
@@ -314,6 +432,7 @@ class ParquetStore(StorageBackend):
             self._advance_batch()
 
         span_dict = self._span_to_dict(span)
+        self._apply_pending_to_span_dict(span_dict)
         self._span_buffer.append(span_dict)
         self._stats["spans_added"] += 1
 
@@ -352,6 +471,7 @@ class ParquetStore(StorageBackend):
         """Add multiple spans to storage."""
         for span in spans:
             span_dict = self._span_to_dict(span)
+            self._apply_pending_to_span_dict(span_dict)
             self._span_buffer.append(span_dict)
             self._stats["spans_added"] += 1
 

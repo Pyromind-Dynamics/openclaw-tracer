@@ -436,11 +436,13 @@ curl http://localhost:43886/tracer-version
 
 End a task session. Optionally pass the episode-level **final reward**: prefer the field `final_reward`; if omitted, the alias `reward` is accepted. When both are present, `final_reward` wins. If neither is passed, the response `final_reward` is `null`. Invalid numbers return 400.
 
+Optional field **`gt`** (alias `ground_truth`, string or JSON): merged into every span for that `task_id` under `attributes.gt` / `attributes["task.gt"]`. Omit it when you do not need SFT export; if you rebuild `sft_daily` samples from spans alone, reward headers are not enough — include GT.
+
 ```bash
 curl -X POST http://localhost:43886/end_task \
   -H "Content-Type: application/json" \
   -H "Authorization: Bearer your-proxy-key" \
-  -d '{"task_id": "my-task-123", "final_reward": 1.0}'
+  -d '{"task_id": "my-task-123", "final_reward": 1.0, "gt": "<think>...</think>\n\n{\"result\":\"defect\",\"reason\":\"scratch\",\"boxes\":[]}"}'
 ```
 
 #### POST /admin/flush

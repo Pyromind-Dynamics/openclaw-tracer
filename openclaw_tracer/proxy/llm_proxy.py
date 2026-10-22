@@ -1626,6 +1626,17 @@ class LLMProxy:
                         status_code=400,
                     )
 
+            # Ground truth for SFT/GRPO export (reward alone is not enough).
+            gt_raw = body.get("gt")
+            if gt_raw is None:
+                gt_raw = body.get("ground_truth")
+            gt_text: Optional[str] = None
+            if gt_raw is not None:
+                if isinstance(gt_raw, (dict, list)):
+                    gt_text = json.dumps(gt_raw, ensure_ascii=False)
+                else:
+                    gt_text = str(gt_raw)
+
             stats = await self.task_manager.end_task(task_id, final_reward=final_reward)
             if stats is None:
                 return JSONResponse(
@@ -1635,6 +1646,8 @@ class LLMProxy:
 
             if isinstance(self.store, ParquetStore):
                 await self.store.apply_rollout_final_reward(stats.task_id, stats.final_reward)
+                if gt_text is not None and gt_text != "":
+                    await self.store.apply_rollout_gt(stats.task_id, gt_text)
 
             return JSONResponse(
                 {
@@ -1643,6 +1656,7 @@ class LLMProxy:
                     "total_requests": stats.total_requests,
                     "duration_seconds": stats.duration_seconds,
                     "final_reward": stats.final_reward,
+                    "gt_chars": len(gt_text) if gt_text is not None else 0,
                 },
                 status_code=200
             )

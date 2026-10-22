@@ -438,11 +438,13 @@ curl http://localhost:43886/tracer-version
 
 结束指定 task 会话。可选传入本轮 **最终 reward**（episode 级别）：优先使用字段 `final_reward`，若省略则用别名 `reward`；二者同时存在时以 `final_reward` 为准。未传入时响应里 `final_reward` 为 `null`。无效数字返回 400。
 
+可选字段 **`gt`**（别名 `ground_truth`，字符串或 JSON）：写入该 `task_id` 下所有 span 的 `attributes.gt` / `attributes["task.gt"]`。不做 SFT 导出时可不传；若要从 span **单独**重建 `sft_daily` 样本，仅有 `X-Previous-Reward` / `final_reward` 不够，建议带上 GT。
+
 ```bash
 curl -X POST http://localhost:43886/end_task \
   -H "Content-Type: application/json" \
   -H "Authorization: Bearer your-proxy-key" \
-  -d '{"task_id": "my-task-123", "final_reward": 1.0}'
+  -d '{"task_id": "my-task-123", "final_reward": 1.0, "gt": "<think>...</think>\n\n{\"result\":\"defect\",\"reason\":\"擦伤\",\"boxes\":[]}"}'
 ```
 
 #### POST /admin/flush
