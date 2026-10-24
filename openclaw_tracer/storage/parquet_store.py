@@ -179,8 +179,11 @@ class ParquetStore(StorageBackend):
             # Non-batch mode: spans written directly to data/spans/
             pass
 
-        # Current time window for spans
+        # Current time window for spans. ``_window_generation`` bumps when an admin
+        # asks to seal the live shard (so a consumed window can be deleted without
+        # swallowing rows written from then on); it resets on a real window change.
         self._current_span_window = _get_time_window(time_window_minutes)
+        self._window_generation = 0
 
         # Span buffer
         self._span_buffer: List[Dict[str, Any]] = []
@@ -643,10 +646,11 @@ class ParquetStore(StorageBackend):
         if not self._span_buffer:
             return
 
-        # Update time window if changed
+        # Update time window if changed (a real window change resets the seal)
         current_window = _get_time_window(self.time_window_minutes)
         if new_window or current_window != self._current_span_window:
             self._current_span_window = current_window
+            self._window_generation = 0
 
         # Determine target directory
         if self._batch_mode:
@@ -656,7 +660,7 @@ class ParquetStore(StorageBackend):
             target_dir = self.output_dir / "spans"
 
         # Write to time-sharded file
-        spans_path = target_dir / f"{self.SPAN_PREFIX}{self._current_span_window}.parquet"
+        spans_path = target_dir / self._shard_name()
         df = pd.DataFrame(self._span_buffer)
 
         # If file exists, append to it (same time window)
@@ -902,6 +906,194 @@ class ParquetStore(StorageBackend):
             "released_batch_index": batch_index,
             "deleted_path": deleted_path,
             "status": self.get_collection_status(),
+        }
+
+    def _media_images_root(self) -> Path:
+        """``spans/media/images/<trace_id>/`` holds inline images per trace."""
+        return self.output_dir / "spans" / "media" / "images"
+
+    def _shard_name(self) -> str:
+        """File name of the live shard; ``_g<n>`` marks shards opened by a seal."""
+        suffix = f"_g{self._window_generation}" if self._window_generation else ""
+        return f"{self.SPAN_PREFIX}{self._current_span_window}{suffix}.parquet"
+
+    def _current_window_path(self) -> Path:
+        """The shard the tracer may still be appending to (non-batch mode)."""
+        if self._batch_mode:
+            return self.output_dir / "spans" / str(self._current_batch_index) / self._shard_name()
+        return self.output_dir / "spans" / self._shard_name()
+
+    def _seal_current_shard(self) -> str:
+        """Open a fresh shard so the live one can be deleted without losing writes."""
+        self._window_generation += 1
+        sealed = self._current_window_path()
+        logger.info("Sealed span shard; next writes go to %s", sealed.name)
+        return sealed.name
+
+    def _trace_ids_in(self, path: Path) -> set:
+        """Trace ids of one shard; empty when the shard has no such column."""
+        try:
+            table = pq.read_table(path, columns=["trace_id"])
+        except Exception:  # noqa: BLE001 - missing column or corrupt shard
+            return set()
+        return {str(v) for v in table.column("trace_id").to_pylist() if v}
+
+    def _resolve_span_file(self, name: str) -> Path:
+        """Map a caller-supplied shard to a path inside ``spans/``.
+
+        The orchestrator reports host paths (``datas/openclaw-val-eval/spans/x``)
+        while the tracer sees the same tree mounted elsewhere (``/app/data``), so
+        an absolute or relative join cannot match; fall back to the
+        relative-to-``spans/`` suffix, then to a unique basename. Unknown names
+        resolve to a non-existent path inside ``spans/`` and are reported as
+        ``missing`` — release must stay idempotent across retries.
+        """
+        spans_root = (self.output_dir / "spans").resolve()
+
+        def _inside(path: Path) -> Path:
+            resolved = path.resolve()
+            try:
+                resolved.relative_to(spans_root)
+            except ValueError:
+                raise ValueError(
+                    f"refusing to release {name}: outside {spans_root}"
+                ) from None
+            return resolved
+
+        raw = Path(str(name))
+        if raw.is_absolute() and raw.exists():
+            return _inside(raw)
+        for cand in (self.output_dir / raw, self.output_dir / "spans" / raw):
+            if cand.exists():
+                return _inside(cand)
+
+        shards = self._iter_span_parquet_paths()
+        normalized = "/" + str(raw).replace("\\", "/").lstrip("./")
+        rel = normalized.split("/spans/", 1)[1] if "/spans/" in normalized else None
+        if rel:
+            for shard in shards:
+                # Prefer the shard whose path relative to spans/ matches exactly,
+                # so ``<batch>/spans_x.parquet`` never collapses onto a root shard.
+                if str(shard.resolve().relative_to(spans_root)).replace("\\", "/") == rel:
+                    return _inside(shard)
+        by_name = [s for s in shards if s.name == raw.name]
+        if len(by_name) == 1:
+            return _inside(by_name[0])
+        # Unknown shard: validate anyway so ``..`` in the name cannot escape.
+        return _inside(spans_root / (rel or raw.name))
+
+    async def release_spans(
+        self,
+        files: Optional[List[str]] = None,
+        *,
+        keep_current: bool = True,
+        reason: str = "training_complete",
+    ) -> Dict[str, Any]:
+        """Delete consumed span shards (and their images) so they cannot be reread.
+
+        This is the consumption watermark: the orchestrator names the shards its
+        export actually read, and they are removed from the store instead of
+        being left for the next round to pick up again. Works with or without
+        batch mode; batch mode requires explicit ``files`` so a batch that is
+        still collecting is never wiped.
+
+        ``keep_current`` defaults to true and merely spares the live shard. Pass
+        false when the export consumed it too: the shard is sealed first (writes
+        move to a fresh ``_g<n>`` file) and then deleted, so no row written from
+        that moment on is lost.
+
+        Media is pruned only for trace ids that no surviving shard still needs,
+        so images of a newer, not-yet-consumed trace are never lost.
+
+        Raises:
+            ValueError: path outside ``spans/``, or batch mode without ``files``.
+        """
+        if self._batch_mode and not files:
+            raise ValueError(
+                "batch mode requires explicit files; "
+                "use POST /admin/batches/{id}/release instead"
+            )
+
+        if files:
+            candidates = [self._resolve_span_file(f) for f in files]
+        else:
+            candidates = [p.resolve() for p in self._iter_span_parquet_paths()]
+
+        deleted_files: List[str] = []
+        skipped: List[Dict[str, Any]] = []
+        deleted_rows = 0
+        deleted_traces: set = set()
+        sealed: Optional[str] = None
+
+        for path in candidates:
+            if path == self._current_window_path().resolve():
+                if keep_current:
+                    # The tracer is still appending here; deleting it would drop
+                    # the rows written between the export and now.
+                    skipped.append({"path": str(path), "reason": "current_window"})
+                    continue
+                if path.is_file():
+                    sealed = self._seal_current_shard()
+            if not path.is_file():
+                skipped.append({"path": str(path), "reason": "missing"})
+                continue
+            try:
+                deleted_rows += pq.read_table(path).num_rows
+            except Exception:  # noqa: BLE001
+                logger.warning("release_spans: cannot count rows in %s", path)
+            deleted_traces |= self._trace_ids_in(path)
+            path.unlink()
+            deleted_files.append(str(path))
+            logger.info("Released (deleted) consumed span shard %s", path)
+
+        media_root = self._media_images_root()
+        remaining_traces: set = set()
+        if deleted_traces and media_root.is_dir():
+            for path in self._iter_span_parquet_paths():
+                remaining_traces |= self._trace_ids_in(path)
+        deleted_media: List[str] = []
+        if deleted_traces and media_root.is_dir():
+            for folder in sorted(media_root.iterdir()):
+                if not folder.is_dir():
+                    continue
+                if folder.name not in deleted_traces or folder.name in remaining_traces:
+                    continue
+                shutil.rmtree(folder, ignore_errors=True)
+                deleted_media.append(str(folder))
+            if deleted_media:
+                logger.info("Released (deleted) %d consumed media dirs", len(deleted_media))
+
+        if deleted_files or deleted_media:
+            try:
+                from openclaw_tracer.data_callback import (
+                    build_data_delete_event,
+                    schedule_data_delete_callback,
+                )
+
+                schedule_data_delete_callback(
+                    build_data_delete_event(
+                        reason=reason,
+                        paths=deleted_files + deleted_media,
+                        extra={
+                            "deleted_rows": deleted_rows,
+                            "deleted_traces": len(deleted_traces),
+                            "batch_mode": self._batch_mode,
+                        },
+                    )
+                )
+            except Exception:
+                logger.exception("Failed to schedule data delete callback for released spans")
+
+        return {
+            "deleted_files": deleted_files,
+            "deleted_file_count": len(deleted_files),
+            "deleted_rows": deleted_rows,
+            "deleted_media_dirs": deleted_media,
+            "deleted_media_count": len(deleted_media),
+            "skipped": skipped,
+            "sealed_shard": sealed,
+            "kept_files": [str(p) for p in self._iter_span_parquet_paths()],
+            "batch_mode": self._batch_mode,
         }
 
     def get_collection_status(self) -> Dict[str, Any]:

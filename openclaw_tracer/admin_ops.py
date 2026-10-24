@@ -116,8 +116,60 @@ def register_admin_ops_routes(fastapi_app: Any, proxy: Any) -> None:
             )
         return JSONResponse({"ok": True, **result})
 
+    @fastapi_app.post("/admin/spans/release")
+    async def release_spans(request: Request) -> JSONResponse:
+        """Delete consumed span shards (and their images) so they cannot be reread.
+
+        Body (all optional)::
+
+            {"files": ["spans/spans_20261023_073000.parquet"],  // omit = every shard
+             "keep_current": true,                              // spare the live window
+             "reason": "training_complete"}
+
+        The caller names what its export actually consumed; leaving ``files`` out
+        deletes all shards except the window the tracer is still appending to.
+        """
+        err = await _require_admin(request, admin_key)
+        if err:
+            return err
+        if not isinstance(store, ParquetStore):
+            return JSONResponse(
+                {"error": "span release requires ParquetStore"},
+                status_code=501,
+            )
+
+        files = None
+        keep_current = True
+        reason = "training_complete"
+        try:
+            body = await request.json()
+        except Exception:  # noqa: BLE001 - empty body is valid
+            body = None
+        if isinstance(body, dict):
+            raw_files = body.get("files")
+            if isinstance(raw_files, str):
+                files = [raw_files]
+            elif isinstance(raw_files, (list, tuple)):
+                files = [str(f) for f in raw_files if str(f).strip()]
+            if "keep_current" in body:
+                keep_current = bool(body.get("keep_current"))
+            if str(body.get("reason") or "").strip():
+                reason = str(body["reason"]).strip()
+
+        try:
+            result = await store.release_spans(
+                files=files, keep_current=keep_current, reason=reason
+            )
+        except ValueError as exc:
+            return JSONResponse(
+                {"error": str(exc), "code": "invalid_span_path"},
+                status_code=400,
+            )
+        return JSONResponse({"ok": True, **result})
+
     fastapi_app.state.openclaw_admin_ops_registered = True
     logger.info(
-        "[AdminOps] Registered /admin/flush and /admin/batches (enabled=%s)",
+        "[AdminOps] Registered /admin/flush, /admin/batches and /admin/spans/release "
+        "(enabled=%s)",
         bool(admin_key),
     )

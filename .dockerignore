@@ -31,6 +31,7 @@ wheels/
 
 # Virtual environments
 venv/
+.venv/
 env/
 ENV/
 .conda/
