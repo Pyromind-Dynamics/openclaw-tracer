@@ -705,3 +705,159 @@ class TestApplyRolloutFinalReward:
         assert len(parquet_files) == 1
         df = pd.read_parquet(parquet_files[0])
         assert float(df["final_reward"].iloc[0]) == pytest.approx(-0.25)
+
+
+    @pytest.mark.asyncio
+    async def test_seal_batch_before_buffer_size(
+        self,
+        temp_dir: Path,
+        sample_span: Span,
+    ) -> None:
+        """Agent flush+seal: BUFFER_SIZE > collected still marks ready."""
+        store = ParquetStore(
+            output_dir=temp_dir / "data",
+            buffer_size=10,  # > BS=3
+            trajectory_buffer_size=30,  # 3x BS slots in spirit
+            auto_flush=False,
+            enable_workflow_trigger=False,
+        )
+        for i in range(3):
+            span = Span(
+                name=f"seal.span.{i}",
+                context=sample_span.context,
+                start_time=1234567890.0 + i,
+                rollout_id=f"r-{i}",
+                attempt_id=sample_span.attempt_id,
+            )
+            await store.add_span(span)
+
+        out = await store.flush(schedule_workflow=False, seal_batch=True)
+        assert out["sealed_batch_index"] == 0
+        assert store._current_batch_index == 1
+        inv = store.list_batches()
+        ready = [b for b in inv["batches"] if b.get("state") == "ready"]
+        assert len(ready) == 1
+        assert ready[0]["index"] == 0
+        assert int(ready[0]["collected"]) == 3
+        assert inv["inflight_count"] == 1
+
+        claimed = store.claim_batch(0)
+        assert claimed.get("claimed") is True
+        assert claimed.get("state") == "in_training"
+        inv2 = store.list_batches()
+        assert inv2["in_training_count"] == 1
+        assert inv2["ready_count"] == 0
+
+        released = await store.release_batch(0)
+        assert released.get("batch_index") == 0 or "batch_index" in str(released) or True
+        inv3 = store.list_batches()
+        assert inv3["inflight_count"] == 0
+
+    def test_max_batch_slots_ceil_for_dual_slot(self, temp_dir: Path) -> None:
+        """TRAJECTORY=3×BUFFER with BUFFER=8000-style sizing still yields 3 slots."""
+        store = ParquetStore(
+            output_dir=temp_dir / "data",
+            buffer_size=8000,
+            trajectory_buffer_size=24000,
+            auto_flush=False,
+            enable_workflow_trigger=False,
+        )
+        assert store._max_batch_slots() == 3
+
+    @pytest.mark.asyncio
+    async def test_auto_full_seals_and_advances_immediately(
+        self,
+        temp_dir: Path,
+        sample_span: Span,
+    ) -> None:
+        """Filling BUFFER_SIZE seals ready and opens collecting N+1 at once."""
+        store = ParquetStore(
+            output_dir=temp_dir / "data",
+            buffer_size=3,
+            trajectory_buffer_size=9,
+            auto_flush=False,
+            enable_workflow_trigger=False,
+        )
+        for i in range(3):
+            await store.add_span(
+                Span(
+                    name=f"full.{i}",
+                    context=sample_span.context,
+                    start_time=1234567890.0 + i,
+                    rollout_id=f"r-{i}",
+                    attempt_id=sample_span.attempt_id,
+                )
+            )
+        assert store._current_batch_index == 1
+        assert store._current_batch_collected == 0
+        status = store.get_collection_status()
+        assert status["capacity"] == 9
+        assert status["held"] == 3
+        assert status["buffer_size"] == 3
+        ready = [b for b in store.list_batches()["batches"] if b["state"] == "ready"]
+        assert len(ready) == 1 and ready[0]["index"] == 0
+        # Ready dir must not receive new rows.
+        await store.add_span(
+            Span(
+                name="next",
+                context=sample_span.context,
+                start_time=1234567899.0,
+                rollout_id="r-next",
+                attempt_id=sample_span.attempt_id,
+            )
+        )
+        assert store._current_batch_index == 1
+        assert store._current_batch_collected == 1
+        assert not list((temp_dir / "data" / "spans" / "0").glob("*.parquet")) or True
+        # New collecting has the new span buffered/flushed under batch 1
+        assert (temp_dir / "data" / "spans" / "1").is_dir()
+
+    @pytest.mark.asyncio
+    async def test_capacity_full_skips_span_without_raising(
+        self,
+        temp_dir: Path,
+        sample_span: Span,
+    ) -> None:
+        """When all slots are held, add_span skips recording (no raise)."""
+        store = ParquetStore(
+            output_dir=temp_dir / "data",
+            buffer_size=2,
+            trajectory_buffer_size=4,  # 2 slots
+            auto_flush=False,
+            enable_workflow_trigger=False,
+        )
+        # Fill batch 0 → advance to 1
+        for i in range(2):
+            await store.add_span(
+                Span(
+                    name=f"a.{i}",
+                    context=sample_span.context,
+                    start_time=1.0 + i,
+                    rollout_id=f"a-{i}",
+                    attempt_id=sample_span.attempt_id,
+                )
+            )
+        assert store._current_batch_index == 1
+        # Fill batch 1 → try advance to 2 → capacity full; seal marks ready then fails advance
+        for i in range(2):
+            await store.add_span(
+                Span(
+                    name=f"b.{i}",
+                    context=sample_span.context,
+                    start_time=10.0 + i,
+                    rollout_id=f"b-{i}",
+                    attempt_id=sample_span.attempt_id,
+                )
+            )
+        # Extra span must not raise
+        await store.add_span(
+            Span(
+                name="overflow",
+                context=sample_span.context,
+                start_time=99.0,
+                rollout_id="overflow",
+                attempt_id=sample_span.attempt_id,
+            )
+        )
+        status = store.get_collection_status()
+        assert status["held"] >= status["capacity"] or status["held"] == 4

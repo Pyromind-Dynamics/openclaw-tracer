@@ -23,37 +23,45 @@ def register_admin_ops_routes(fastapi_app: Any, proxy: Any) -> None:
     admin_key: Optional[str] = getattr(proxy, "admin_api_key", None)
     store = proxy.store
 
+    def _bool_flag(raw: Any) -> bool:
+        if isinstance(raw, bool):
+            return raw
+        if isinstance(raw, str):
+            return raw.strip().lower() in {"1", "true", "yes", "on"}
+        return bool(raw)
+
     @fastapi_app.post("/admin/flush")
     async def admin_flush(request: Request) -> JSONResponse:
         """Flush in-memory spans to Parquet (ADMIN_API_KEY).
 
-        Optional ``trigger_workflow`` (JSON body or query, default false).
+        Body/query flags:
+          - ``trigger_workflow`` (default false): fire WORKFLOW_TRIGGER_SCRIPT
+          - ``seal_batch`` (default false): ops-only — seal collecting as ready
+            (even if collected < BUFFER_SIZE), immediately advance to the next
+            collecting dir, then optionally trigger. Same pipeline as auto-full.
+            Agent feeders should not call this; they only write spans.
         """
         err = await _require_admin(request, admin_key)
         if err:
             return err
 
         trigger_workflow = False
+        seal_batch = False
         try:
             body = await request.json()
-            if isinstance(body, dict) and "trigger_workflow" in body:
-                raw = body.get("trigger_workflow")
-                if isinstance(raw, bool):
-                    trigger_workflow = raw
-                elif isinstance(raw, str):
-                    trigger_workflow = raw.strip().lower() in {
-                        "1",
-                        "true",
-                        "yes",
-                        "on",
-                    }
-                else:
-                    trigger_workflow = bool(raw)
+            if isinstance(body, dict):
+                if "trigger_workflow" in body:
+                    trigger_workflow = _bool_flag(body.get("trigger_workflow"))
+                if "seal_batch" in body:
+                    seal_batch = _bool_flag(body.get("seal_batch"))
         except Exception:
             pass
         qp = request.query_params.get("trigger_workflow")
         if qp is not None:
-            trigger_workflow = qp.strip().lower() in {"1", "true", "yes", "on"}
+            trigger_workflow = _bool_flag(qp)
+        qp_seal = request.query_params.get("seal_batch")
+        if qp_seal is not None:
+            seal_batch = _bool_flag(qp_seal)
 
         if not hasattr(store, "flush"):
             return JSONResponse(
@@ -61,18 +69,69 @@ def register_admin_ops_routes(fastapi_app: Any, proxy: Any) -> None:
                 status_code=501,
             )
 
-        if trigger_workflow and isinstance(store, ParquetStore):
-            await store.flush(schedule_workflow=True)
-        else:
-            await store.flush()
+        flush_result: Dict[str, Any] = {}
+        try:
+            if isinstance(store, ParquetStore):
+                out = await store.flush(
+                    schedule_workflow=trigger_workflow,
+                    seal_batch=seal_batch,
+                )
+                if isinstance(out, dict):
+                    flush_result = out
+            else:
+                await store.flush()
+        except Exception as exc:  # noqa: BLE001
+            # BatchCapacityFull and seal errors surface as 409/400.
+            from openclaw_tracer.storage.parquet_store import BatchCapacityFull
+
+            if isinstance(exc, BatchCapacityFull):
+                return JSONResponse(
+                    {"error": str(exc), "code": "batch_capacity_full"},
+                    status_code=409,
+                )
+            if isinstance(exc, ValueError):
+                return JSONResponse(
+                    {"error": str(exc), "code": "invalid_flush"},
+                    status_code=400,
+                )
+            raise
 
         status_payload: Dict[str, Any] = {
             "ok": True,
             "trigger_workflow": trigger_workflow,
+            "seal_batch": seal_batch,
+            **flush_result,
         }
         if hasattr(store, "get_collection_status"):
             status_payload["status"] = store.get_collection_status()
+        if isinstance(store, ParquetStore):
+            status_payload["batches"] = store.list_batches()
         return JSONResponse(status_payload, status_code=200)
+
+    @fastapi_app.post("/admin/batches/{batch_index}/claim")
+    async def claim_batch(request: Request, batch_index: int) -> JSONResponse:
+        """Claim a ready batch for training (state → in_training)."""
+        err = await _require_admin(request, admin_key)
+        if err:
+            return err
+        if not isinstance(store, ParquetStore):
+            return JSONResponse(
+                {"error": "batch claim requires ParquetStore"},
+                status_code=501,
+            )
+        try:
+            result = store.claim_batch(batch_index)
+        except ValueError as exc:
+            return JSONResponse(
+                {"error": str(exc), "code": "invalid_batch"},
+                status_code=400,
+            )
+        except FileNotFoundError as exc:
+            return JSONResponse(
+                {"error": str(exc), "code": "batch_not_found"},
+                status_code=404,
+            )
+        return JSONResponse({"ok": True, **result})
 
     @fastapi_app.get("/admin/batches")
     async def list_batches(request: Request) -> JSONResponse:

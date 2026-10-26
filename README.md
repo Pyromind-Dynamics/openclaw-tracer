@@ -146,6 +146,8 @@ Create `config/models.json` with your model configurations:
 
 When `TRAJECTORY_BUFFER_SIZE > 0`, each full `BUFFER_SIZE` batch is marked **ready**, kept on disk for training, and may trigger `WORKFLOW_TRIGGER`. Ready batches are **not** auto-deleted. After training, call `POST /admin/batches/{id}/release` to remove that batch (fires `DATA_DELETE_CALLBACK`). If all slots are full of unreleased ready batches, new collection pauses (`BatchCapacityFull`) until you release.
 
+**Dual-slot (producer-only agent):** `BUFFER_SIZE=8000` auto-seals (`flush→ready→advance→trigger`); `TRAJECTORY_BUFFER_SIZE=24000` (~3 slots). Agents only write spans and pace on public `GET /status` (`held` vs `capacity`). Ops may `POST /admin/flush` with `seal_batch=true`. Orch claims/releases by `batch_id`.
+
 **Example using environment variables:**
 
 ```bash
@@ -155,8 +157,9 @@ export ORIGIN_MODEL="gpt-4"
 export API_MODE="openai"
 export API_URL="https://api.example.com/v1"
 export ACCESS_KEY="sk-xxx"
-export BUFFER_SIZE=100
-export TRAJECTORY_BUFFER_SIZE=10000
+# Agent BS=3500 → BUFFER_SIZE higher; trajectory ≈ 3×BS
+export BUFFER_SIZE=5000
+export TRAJECTORY_BUFFER_SIZE=10500
 export FLUSH_INTERVAL_SECONDS=300
 
 python scripts/serve.py
@@ -447,21 +450,27 @@ curl -X POST http://localhost:43886/end_task \
 
 #### POST /admin/flush
 
-Flush in-memory span buffers to Parquet immediately (`ADMIN_API_KEY` required). Optional `trigger_workflow` (query or JSON body, default `false`) also schedules the buffer-full workflow trigger script.
+Flush in-memory span buffers to Parquet immediately (`ADMIN_API_KEY` required).
+
+- `trigger_workflow` (default `false`): schedule `WORKFLOW_TRIGGER_SCRIPT`
+- `seal_batch` (default `false`): in batch mode, mark the current collecting batch **ready** even when `collected < BUFFER_SIZE`, then open the next slot (agent-paced dual-slot)
 
 ```bash
 curl -X POST http://localhost:43886/admin/flush \
   -H "Authorization: Bearer your-admin-key" \
   -H "Content-Type: application/json" \
-  -d '{"trigger_workflow": false}'
+  -d '{"seal_batch": true, "trigger_workflow": true}'
 ```
 
-#### GET /admin/batches · POST /admin/batches/{id}/release
+#### GET /admin/batches · POST /admin/batches/{id}/claim · POST /admin/batches/{id}/release
 
-List held/ready trajectory batches, or release a **ready** batch after training (`ADMIN_API_KEY`). Release deletes `spans/<id>/` (including media) and fires the data-delete callback with `reason=training_complete`.
+List batches (`ready` / `collecting` / `in_training`, plus `inflight_count` for agent backpressure). Claim marks `ready → in_training`. Release deletes a `ready` or `in_training` batch after training (`ADMIN_API_KEY`).
 
 ```bash
 curl http://localhost:43886/admin/batches \
+  -H "Authorization: Bearer your-admin-key"
+
+curl -X POST http://localhost:43886/admin/batches/0/claim \
   -H "Authorization: Bearer your-admin-key"
 
 curl -X POST http://localhost:43886/admin/batches/0/release \

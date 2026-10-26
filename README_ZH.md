@@ -148,6 +148,8 @@ docker-compose up -d
 
 当 `TRAJECTORY_BUFFER_SIZE > 0` 时，每凑满一个 `BUFFER_SIZE` 的 batch 会标记为 **ready** 并保留在磁盘上供训练（可触发 `WORKFLOW_TRIGGER`），**不会自动删除**。训练结束后调用 `POST /admin/batches/{id}/release` 才会删除该批（并触发 `DATA_DELETE_CALLBACK`）。若所有槽位都被未释放的 ready batch 占满，采集会暂停（`BatchCapacityFull`），直到 release。
 
+**双槽流水线（agent 控节奏）**：设 `BUFFER_SIZE > agent BS` 避免自动封批抢跑，`TRAJECTORY_BUFFER_SIZE = 3×BS` 约三槽。Agent 用 `POST /admin/flush` `{"seal_batch":true,"trigger_workflow":true}` 封批；orch 按 `batch_id` claim/release。背压：`inflight_count`（ready+in_training）> 2 时停喂。
+
 **使用环境变量示例：**
 
 ```bash
@@ -157,8 +159,9 @@ export ORIGIN_MODEL="gpt-4"
 export API_MODE="openai"
 export API_URL="https://api.example.com/v1"
 export ACCESS_KEY="sk-xxx"
-export BUFFER_SIZE=100
-export TRAJECTORY_BUFFER_SIZE=10000
+# Agent BS=3500 → BUFFER_SIZE 更高；trajectory ≈ 3×BS
+export BUFFER_SIZE=5000
+export TRAJECTORY_BUFFER_SIZE=10500
 export FLUSH_INTERVAL_SECONDS=300
 
 python scripts/serve.py

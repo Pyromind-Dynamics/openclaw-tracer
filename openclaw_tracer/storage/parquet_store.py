@@ -424,15 +424,27 @@ class ParquetStore(StorageBackend):
     async def add_span(self, span: Span) -> None:
         """Add a single span to storage.
 
-        In batch mode a full batch is marked ``ready`` (held for training) and a
-        new collecting batch is opened. Ready batches are never auto-deleted;
-        call ``release_batch`` after training. If all TRAJECTORY_BUFFER_SIZE
-        slots are occupied by unreleased batches, raises ``BatchCapacityFull``.
+        In batch mode a full batch is sealed as ``ready``, a new collecting
+        directory is opened immediately, then ``WORKFLOW_TRIGGER`` may fire.
+        Ready batches are never auto-deleted; call ``release_batch`` after train.
+
+        If all trajectory slots are occupied, the span is **skipped** (logged)
+        and this method returns without raising — chat/inference must stay 200.
         """
-        # Current batch already full → hold it for training, open a new slot
+        try:
+            await self._add_span_impl(span)
+        except BatchCapacityFull:
+            logger.warning(
+                "Batch capacity full (%s/%s slots); skip span record "
+                "(inference response unaffected)",
+                len(self._list_batch_indices()),
+                self._max_batch_slots() if self._batch_mode else 0,
+            )
+
+    async def _add_span_impl(self, span: Span) -> None:
+        # Stuck on a full/ready batch → finish seal (flush→ready→advance→trigger).
         if self._batch_mode and self._current_batch_collected >= self.buffer_size:
-            self._mark_batch_ready(self._current_batch_index)
-            self._advance_batch()
+            await self.seal_current_batch(schedule_workflow=True)
 
         span_dict = self._span_to_dict(span)
         self._apply_pending_to_span_dict(span_dict)
@@ -443,32 +455,23 @@ class ParquetStore(StorageBackend):
             self._current_batch_collected += 1
             self._write_batch_meta(
                 self._current_batch_index,
-                state=(
-                    "ready"
-                    if self._current_batch_collected >= self.buffer_size
-                    else "collecting"
-                ),
+                state="collecting",
                 collected=self._current_batch_collected,
             )
 
-        # Check if we need to flush (buffer full, time window changed, or batch ready)
         current_window = _get_time_window(self.time_window_minutes)
-        batch_ready = self._batch_mode and self._current_batch_collected >= self.buffer_size
+        batch_full = self._batch_mode and self._current_batch_collected >= self.buffer_size
         buffer_full_flush = self.auto_flush and len(self._span_buffer) >= self.buffer_size
-        should_flush = (
-            buffer_full_flush
-            or current_window != self._current_span_window
-            or batch_ready
-        )
-        schedule_workflow = batch_ready or (not self._batch_mode and buffer_full_flush)
+        window_changed = current_window != self._current_span_window
 
-        if should_flush:
+        if batch_full:
+            # flush → ready → advance → trigger (isolates parquet for training)
+            await self.seal_current_batch(schedule_workflow=True)
+        elif buffer_full_flush or window_changed:
             await self._flush_spans(
-                new_window=current_window != self._current_span_window,
-                schedule_workflow=schedule_workflow,
+                new_window=window_changed,
+                schedule_workflow=(not self._batch_mode and buffer_full_flush),
             )
-            if batch_ready:
-                self._mark_batch_ready(self._current_batch_index)
 
     async def add_spans(self, spans: List[Span]) -> None:
         """Add multiple spans to storage."""
@@ -562,17 +565,82 @@ class ParquetStore(StorageBackend):
                 logger.info(f"Periodic flush: {len(self._span_buffer)} spans in buffer")
                 await self.flush()
 
-    async def flush(self, schedule_workflow: bool = False) -> None:
-        """Flush all buffered data to storage.
+    async def flush(
+        self,
+        schedule_workflow: bool = False,
+        *,
+        seal_batch: bool = False,
+    ) -> Dict[str, Any]:
+        """Flush buffered spans; optionally seal the collecting batch.
 
         Args:
-            schedule_workflow: If True, also fire the buffer-full workflow trigger.
+            schedule_workflow: Fire WORKFLOW_TRIGGER after a successful seal
+                (or after a non-seal flush when not sealing).
+            seal_batch: Ops path — seal current collecting as ready even when
+                ``collected < buffer_size``, then immediately open the next
+                collecting directory (same pipeline as auto-full). Agent feeders
+                should not call this; they only write spans.
         """
         current_window = _get_time_window(self.time_window_minutes)
         await self._flush_spans(
             new_window=current_window != self._current_span_window,
-            schedule_workflow=schedule_workflow,
+            schedule_workflow=schedule_workflow and not seal_batch,
         )
+        result: Dict[str, Any] = {
+            "sealed_batch_index": None,
+            "current_batch_index": self._current_batch_index,
+            "current_batch_collected": self._current_batch_collected,
+            "batch_mode": self._batch_mode,
+        }
+        if seal_batch and self._batch_mode:
+            sealed = await self.seal_current_batch(schedule_workflow=schedule_workflow)
+            result["sealed_batch_index"] = sealed
+            result["current_batch_index"] = self._current_batch_index
+            result["current_batch_collected"] = self._current_batch_collected
+        return result
+
+    async def seal_current_batch(self, *, schedule_workflow: bool = False) -> Optional[int]:
+        """Seal collecting batch: flush → ready → advance → optional trigger.
+
+        Used by auto-full (BUFFER_SIZE reached) and by admin
+        ``flush(seal_batch=true)``. Isolates training parquet under
+        ``spans/<id>/`` while new traffic goes to the next collecting dir.
+
+        Returns the sealed batch index, or None if there was nothing to seal.
+        Raises ``BatchCapacityFull`` if a new collecting slot cannot be opened.
+        """
+        if not self._batch_mode:
+            raise ValueError("seal_batch requires TRAJECTORY_BUFFER_SIZE > 0")
+
+        if self._span_buffer:
+            await self._flush_spans(schedule_workflow=False)
+
+        meta = self._read_batch_meta(self._current_batch_index)
+        state = str(meta.get("state") or "collecting")
+        collected = int(meta.get("collected") or self._current_batch_collected or 0)
+        if state == "ready":
+            # Already sealed; must advance so new spans do not append to ready.
+            self._advance_batch()
+            return (
+                self._current_batch_index - 1 if self._current_batch_index > 0 else 0
+            )
+
+        if collected <= 0 and not any(
+            self._batch_dir(self._current_batch_index).glob("*.parquet")
+        ):
+            return None
+
+        sealed_index = self._current_batch_index
+        self._mark_batch_ready(sealed_index, collected=collected)
+        self._advance_batch()
+
+        if schedule_workflow and self._workflow_trigger_enabled:
+            try:
+                schedule_workflow_trigger(self._workflow_trigger_script_path)
+            except Exception:  # noqa: BLE001
+                logger.exception("seal_batch workflow trigger failed")
+
+        return sealed_index
 
     async def close(self) -> None:
         """Close the storage backend."""
@@ -694,25 +762,36 @@ class ParquetStore(StorageBackend):
     def prepare_media_images_prefix(self) -> str:
         """Return relative media dir for the batch that the next span will join.
 
-        Advances when the current batch is already full (same rule as ``add_span``),
-        so inline images land under the same ``spans/<n>/`` tree as the parquet
-        shard. Full batches are held until ``release_batch`` after training.
+        When the current batch is already full, prefer the next collecting
+        index if a slot is free; otherwise keep pointing at the held ready
+        batch (``add_span`` will skip recording when capacity is full).
         """
         if self._batch_mode and self._current_batch_collected >= self.buffer_size:
-            self._mark_batch_ready(self._current_batch_index)
+            meta = self._read_batch_meta(self._current_batch_index)
+            if str(meta.get("state") or "") != "ready":
+                self._mark_batch_ready(self._current_batch_index)
             try:
                 self._advance_batch()
             except BatchCapacityFull:
-                # Stay on the held ready batch; add_span will raise the same error
                 return f"spans/{self._current_batch_index}/media/images"
         if self._batch_mode:
             return f"spans/{self._current_batch_index}/media/images"
         return "spans/media/images"
 
     def _max_batch_slots(self) -> int:
-        if self.buffer_size <= 0:
+        """Max simultaneous batch dirs (ready + collecting + in_training).
+
+        Dual-slot sizing uses ``TRAJECTORY_BUFFER_SIZE ≈ 3× agent BS`` while
+        ``BUFFER_SIZE > BS`` so auto-ready does not race agent flush. Ceiling
+        division keeps ~3 slots when trajectory is 3×BS but BUFFER_SIZE is larger
+        (e.g. BS=3500, BUFFER=5000, trajectory=10500 → 3 slots, not 2).
+        """
+        if self.buffer_size <= 0 or self.trajectory_buffer_size <= 0:
             return 0
-        return max(1, self.trajectory_buffer_size // self.buffer_size)
+        return max(
+            1,
+            (self.trajectory_buffer_size + self.buffer_size - 1) // self.buffer_size,
+        )
 
     def _batch_dir(self, batch_index: int) -> Path:
         return self.output_dir / "spans" / str(batch_index)
@@ -784,18 +863,60 @@ class ParquetStore(StorageBackend):
         path = self._batch_meta_path(batch_index)
         path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
-    def _mark_batch_ready(self, batch_index: int) -> None:
+    def _mark_batch_ready(
+        self, batch_index: int, *, collected: Optional[int] = None
+    ) -> None:
         meta = self._read_batch_meta(batch_index)
-        if meta.get("state") == "ready":
+        if meta.get("state") in {"ready", "in_training"}:
             return
         ready_at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+        if collected is None:
+            collected = int(
+                meta.get("collected")
+                or (
+                    self._current_batch_collected
+                    if batch_index == self._current_batch_index
+                    else self.buffer_size
+                )
+            )
         self._write_batch_meta(
             batch_index,
             state="ready",
-            collected=int(meta.get("collected") or self.buffer_size),
+            collected=collected,
             extra={"ready_at": ready_at},
         )
-        logger.info("Batch %s marked ready (held for training)", batch_index)
+        logger.info(
+            "Batch %s marked ready (held for training, collected=%s)",
+            batch_index,
+            collected,
+        )
+
+    def claim_batch(self, batch_index: int) -> Dict[str, Any]:
+        """Mark a ready batch as ``in_training`` so only one orch round claims it."""
+        if not self._batch_mode:
+            raise ValueError("claim requires TRAJECTORY_BUFFER_SIZE > 0")
+        batch_dir = self._batch_dir(batch_index)
+        if not batch_dir.exists():
+            raise FileNotFoundError(f"batch {batch_index} not found")
+        meta = self._read_batch_meta(batch_index)
+        state = str(meta.get("state") or "collecting")
+        if state == "in_training":
+            return {**meta, "claimed": False, "note": "already_in_training"}
+        if state != "ready":
+            raise ValueError(
+                f"batch {batch_index} is '{state}'; only ready batches can be claimed"
+            )
+        claimed_at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+        self._write_batch_meta(
+            batch_index,
+            state="in_training",
+            collected=int(meta.get("collected") or 0),
+            extra={
+                "ready_at": meta.get("ready_at"),
+                "claimed_at": claimed_at,
+            },
+        )
+        return {**self._read_batch_meta(batch_index), "claimed": True}
 
     def _advance_batch(self) -> None:
         """Open the next collecting batch. Never deletes ready batches.
@@ -827,9 +948,11 @@ class ParquetStore(StorageBackend):
         logger.info(f"Advanced to batch {self._current_batch_index} (held ready batches retained)")
 
     def list_batches(self) -> Dict[str, Any]:
-        """Return ready/collecting batch inventory for admin APIs."""
+        """Return ready/collecting/in_training batch inventory for admin APIs."""
         batches = [self._read_batch_meta(i) for i in self._list_batch_indices()]
         ready = [b for b in batches if b.get("state") == "ready"]
+        in_training = [b for b in batches if b.get("state") == "in_training"]
+        collecting = [b for b in batches if b.get("state") == "collecting"]
         return {
             "batch_mode": self._batch_mode,
             "buffer_size": self.buffer_size,
@@ -838,6 +961,10 @@ class ParquetStore(StorageBackend):
             "current_batch_index": self._current_batch_index,
             "current_batch_collected": self._current_batch_collected,
             "ready_count": len(ready),
+            "in_training_count": len(in_training),
+            "collecting_count": len(collecting),
+            #: Agent backpressure: stop feeding when this exceeds the pipeline depth.
+            "inflight_count": len(ready) + len(in_training),
             "batches": batches,
         }
 
@@ -857,10 +984,10 @@ class ParquetStore(StorageBackend):
 
         meta = self._read_batch_meta(batch_index)
         state = str(meta.get("state") or "collecting")
-        if state != "ready":
+        if state not in {"ready", "in_training"}:
             raise ValueError(
-                f"batch {batch_index} is '{state}'; only ready batches can be released "
-                f"after training"
+                f"batch {batch_index} is '{state}'; only ready/in_training batches "
+                f"can be released after training"
             )
 
         # Flush any buffered rows that still belong to this batch before delete
@@ -1097,26 +1224,40 @@ class ParquetStore(StorageBackend):
         }
 
     def get_collection_status(self) -> Dict[str, Any]:
-        """Return collection progress and held-batch summary."""
+        """Return collection progress for public ``GET /status``.
+
+        Batch mode exposes ``capacity`` (trajectory budget) and ``held``
+        (records already pressed into batch dirs) so producers can pace
+        feeding without admin APIs. Chat remains available when held is full;
+        only recording may skip.
+        """
         if self._batch_mode:
             batches_info = self.list_batches()
             held_records = sum(
                 int(b.get("collected") or 0) for b in batches_info["batches"]
             )
             return {
+                "capacity": self.trajectory_buffer_size,
+                "held": held_records,
+                "buffer_size": self.buffer_size,
                 "collected_data_size": self._current_batch_collected,
                 "total_data_size": held_records,
                 "batch_mode": True,
                 "current_batch_index": self._current_batch_index,
                 "ready_count": batches_info["ready_count"],
+                "in_training_count": batches_info["in_training_count"],
+                "collecting_count": batches_info["collecting_count"],
+                "inflight_count": batches_info["inflight_count"],
                 "max_batch_slots": batches_info["max_batch_slots"],
                 "trajectory_buffer_size": self.trajectory_buffer_size,
             }
-        total = self._current_batch_collected
-        # non-batch: approximate from stats
+        held = self._stats.get("spans_flushed", 0) + len(self._span_buffer)
         return {
+            "capacity": None,
+            "held": held,
+            "buffer_size": self.buffer_size,
             "collected_data_size": len(self._span_buffer),
-            "total_data_size": self._stats.get("spans_flushed", 0) + len(self._span_buffer),
+            "total_data_size": held,
             "batch_mode": False,
         }
 
