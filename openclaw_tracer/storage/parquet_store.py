@@ -154,6 +154,16 @@ class ParquetStore(StorageBackend):
         self.auto_flush = auto_flush
         self.time_window_minutes = time_window_minutes
         self.trajectory_buffer_size = trajectory_buffer_size
+        # Intermediate flush cadence in batch mode (env override). Keeps parquet
+        # on disk while collecting so seal is not a single 8k rewrite, and late
+        # /end_task reward patches hit collecting shards only.
+        chunk_env = os.getenv("PARQUET_FLUSH_CHUNK_SIZE", "").strip()
+        if chunk_env.isdigit() and int(chunk_env) > 0:
+            self._flush_chunk_size = int(chunk_env)
+        elif self.trajectory_buffer_size > 0 and buffer_size > 1:
+            self._flush_chunk_size = max(1, min(500, buffer_size // 8 or 1))
+        else:
+            self._flush_chunk_size = max(1, buffer_size)
 
         # Batch mode: enabled when trajectory_buffer_size > 0
         self._batch_mode = trajectory_buffer_size > 0
@@ -229,6 +239,47 @@ class ParquetStore(StorageBackend):
             paths.extend(sorted(spans_root.glob(f"{self.SPAN_PREFIX}*.parquet")))
         return paths
 
+    def _iter_mutable_span_parquet_paths(self) -> List[Path]:
+        """Shards safe to rewrite for late ``/end_task`` reward/gt patches.
+
+        Never touch ``ready`` / ``in_training`` batches — export may be reading
+        them, and a non-atomic replace on a network mount can delete the file
+        (batch 0 regression: glob saw the path, read got ENOENT).
+        """
+        if not self._batch_mode:
+            return self._iter_span_parquet_paths()
+        batch_dir = self._batch_dir(self._current_batch_index)
+        meta = self._read_batch_meta(self._current_batch_index)
+        if str(meta.get("state") or "collecting") != "collecting":
+            return []
+        if not batch_dir.is_dir():
+            return []
+        return sorted(batch_dir.glob(f"{self.SPAN_PREFIX}*.parquet"))
+
+    @staticmethod
+    def _atomic_write_table(table: Any, path: Path) -> None:
+        """Write parquet via tmp + replace, fsync when the FD API allows."""
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        pq.write_table(table, tmp)
+        try:
+            with open(tmp, "rb") as fh:
+                os.fsync(fh.fileno())
+        except OSError:
+            pass
+        os.replace(tmp, path)
+
+    @staticmethod
+    def _count_parquet_rows(paths: List[Path]) -> int:
+        """Sum row counts across parquet shards; skip unreadable files."""
+        total = 0
+        for path in paths:
+            try:
+                total += int(pq.read_metadata(path).num_rows)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Cannot count rows in %s: %s", path, exc)
+        return total
+
     def _rewrite_parquet_final_reward_for_rollout(
         self, path: Path, rollout_id: str, value: float
     ) -> bool:
@@ -246,9 +297,7 @@ class ParquetStore(StorageBackend):
             return False
         df.loc[mask, "final_reward"] = value
         table = pa.Table.from_pandas(df, schema=_SPAN_SCHEMA, preserve_index=False)
-        tmp = path.with_suffix(path.suffix + ".tmp")
-        pq.write_table(table, tmp)
-        tmp.replace(path)
+        self._atomic_write_table(table, path)
         return True
 
     async def apply_rollout_final_reward(
@@ -265,7 +314,7 @@ class ParquetStore(StorageBackend):
                     buffer_updates += 1
 
             file_updates = 0
-            for path in self._iter_span_parquet_paths():
+            for path in self._iter_mutable_span_parquet_paths():
                 changed = await asyncio.to_thread(
                     self._rewrite_parquet_final_reward_for_rollout,
                     path,
@@ -327,9 +376,7 @@ class ParquetStore(StorageBackend):
             lambda raw: self._merge_gt_into_attributes(raw, gt)
         )
         table = pa.Table.from_pandas(df, schema=_SPAN_SCHEMA, preserve_index=False)
-        tmp = path.with_suffix(path.suffix + ".tmp")
-        pq.write_table(table, tmp)
-        tmp.replace(path)
+        self._atomic_write_table(table, path)
         return True
 
     async def apply_rollout_gt(self, rollout_id: str, gt: str) -> None:
@@ -350,7 +397,7 @@ class ParquetStore(StorageBackend):
                     buffer_updates += 1
 
             file_updates = 0
-            for path in self._iter_span_parquet_paths():
+            for path in self._iter_mutable_span_parquet_paths():
                 changed = await asyncio.to_thread(
                     self._rewrite_parquet_gt_for_rollout, path, rollout_id, text
                 )
@@ -461,13 +508,16 @@ class ParquetStore(StorageBackend):
 
         current_window = _get_time_window(self.time_window_minutes)
         batch_full = self._batch_mode and self._current_batch_collected >= self.buffer_size
+        chunk_full = (
+            self.auto_flush and len(self._span_buffer) >= self._flush_chunk_size
+        )
         buffer_full_flush = self.auto_flush and len(self._span_buffer) >= self.buffer_size
         window_changed = current_window != self._current_span_window
 
         if batch_full:
             # flush → ready → advance → trigger (isolates parquet for training)
             await self.seal_current_batch(schedule_workflow=True)
-        elif buffer_full_flush or window_changed:
+        elif chunk_full or buffer_full_flush or window_changed:
             await self._flush_spans(
                 new_window=window_changed,
                 schedule_workflow=(not self._batch_mode and buffer_full_flush),
@@ -625,10 +675,31 @@ class ParquetStore(StorageBackend):
                 self._current_batch_index - 1 if self._current_batch_index > 0 else 0
             )
 
-        if collected <= 0 and not any(
-            self._batch_dir(self._current_batch_index).glob("*.parquet")
-        ):
+        batch_dir = self._batch_dir(self._current_batch_index)
+        parquet_files = sorted(batch_dir.glob(f"{self.SPAN_PREFIX}*.parquet"))
+        if collected <= 0 and not parquet_files:
             return None
+
+        disk_rows = self._count_parquet_rows(parquet_files)
+        if not parquet_files or disk_rows <= 0:
+            logger.error(
+                "Refusing to seal batch %s: collected=%s but parquet missing/empty "
+                "(files=%s rows=%s) — keep collecting so export cannot claim an "
+                "empty ready batch (batch-0 regression)",
+                self._current_batch_index,
+                collected,
+                [str(p) for p in parquet_files],
+                disk_rows,
+            )
+            return None
+        if collected > 0 and disk_rows < collected:
+            logger.warning(
+                "Sealing batch %s with disk_rows=%s < collected=%s "
+                "(partial flush; export will see what is on disk)",
+                self._current_batch_index,
+                disk_rows,
+                collected,
+            )
 
         sealed_index = self._current_batch_index
         self._mark_batch_ready(sealed_index, collected=collected)
@@ -727,26 +798,29 @@ class ParquetStore(StorageBackend):
         else:
             target_dir = self.output_dir / "spans"
 
-        # Write to time-sharded file
+        # Write to time-sharded file. Hold rewrite lock so concurrent /end_task
+        # patches cannot race an in-place append (batch-0 ENOENT / empty read).
         spans_path = target_dir / self._shard_name()
-        df = pd.DataFrame(self._span_buffer)
+        to_flush = list(self._span_buffer)
 
-        # If file exists, append to it (same time window)
-        if spans_path.exists():
-            existing_df = pq.read_table(spans_path).to_pandas()
-            existing_df = _ensure_final_reward_column(existing_df)
+        async with self._rollout_rewrite_lock:
+            df = pd.DataFrame(to_flush)
+            created = not spans_path.exists()
+            if spans_path.exists():
+                existing_df = pq.read_table(spans_path).to_pandas()
+                existing_df = _ensure_final_reward_column(existing_df)
+                df = _ensure_final_reward_column(df)
+                df = pd.concat([existing_df, df], ignore_index=True)
+
             df = _ensure_final_reward_column(df)
-            df = pd.concat([existing_df, df], ignore_index=True)
+            table = pa.Table.from_pandas(df, schema=_SPAN_SCHEMA, preserve_index=False)
+            await asyncio.to_thread(self._atomic_write_table, table, spans_path)
+            # Only drop buffer after a successful write.
+            del self._span_buffer[: len(to_flush)]
 
-        df = _ensure_final_reward_column(df)
-
-        # Convert to PyArrow table with explicit schema before writing
-        table = pa.Table.from_pandas(df, schema=_SPAN_SCHEMA, preserve_index=False)
-        pq.write_table(table, spans_path)
-        self._stats["spans_flushed"] += len(self._span_buffer)
-        if new_window or not spans_path.exists():
+        self._stats["spans_flushed"] += len(to_flush)
+        if new_window or created:
             self._stats["span_files_created"] += 1
-        self._span_buffer.clear()
 
         if not schedule_workflow and not self._workflow_trigger_enabled:
             logger.info(f"not schedule_workflow and not self._workflow_trigger_enabled")

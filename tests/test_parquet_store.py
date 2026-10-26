@@ -861,3 +861,102 @@ class TestApplyRolloutFinalReward:
         )
         status = store.get_collection_status()
         assert status["held"] >= status["capacity"] or status["held"] == 4
+
+
+class TestBatchParquetHardening:
+    """Forward-fix coverage for the batch-0 empty-export / ENOENT regression."""
+
+    @pytest.mark.asyncio
+    async def test_chunked_flush_writes_parquet_before_seal(
+        self,
+        temp_dir: Path,
+        sample_span: Span,
+    ) -> None:
+        store = ParquetStore(
+            output_dir=temp_dir / "data",
+            buffer_size=8,
+            trajectory_buffer_size=24,
+            auto_flush=True,
+            enable_workflow_trigger=False,
+        )
+        store._flush_chunk_size = 3
+        for i in range(5):
+            await store.add_span(
+                Span(
+                    name=f"chunk.{i}",
+                    context=sample_span.context,
+                    start_time=1.0 + i,
+                    rollout_id=f"c-{i}",
+                    attempt_id=sample_span.attempt_id,
+                )
+            )
+        assert store._current_batch_index == 0
+        shards = list((temp_dir / "data" / "spans" / "0").glob("spans_*.parquet"))
+        assert shards, "collecting batch must flush parquet before seal"
+        assert store._count_parquet_rows(shards) >= 3
+
+    @pytest.mark.asyncio
+    async def test_reward_rewrite_skips_ready_batch(
+        self,
+        temp_dir: Path,
+        sample_span: Span,
+    ) -> None:
+        store = ParquetStore(
+            output_dir=temp_dir / "data",
+            buffer_size=2,
+            trajectory_buffer_size=6,
+            auto_flush=True,
+            enable_workflow_trigger=False,
+        )
+        for i in range(2):
+            await store.add_span(
+                Span(
+                    name=f"ready.{i}",
+                    context=sample_span.context,
+                    start_time=1.0 + i,
+                    rollout_id=f"r-{i}",
+                    attempt_id=sample_span.attempt_id,
+                )
+            )
+        assert store._current_batch_index == 1
+        ready_shards = list((temp_dir / "data" / "spans" / "0").glob("spans_*.parquet"))
+        assert ready_shards
+        before = ready_shards[0].stat().st_mtime_ns
+        # Late end_task for a sealed rollout must not touch ready parquet.
+        await store.apply_rollout_final_reward("r-0", 0.5)
+        after = ready_shards[0].stat().st_mtime_ns
+        assert after == before
+        mutable = store._iter_mutable_span_parquet_paths()
+        assert all(p.parent.name == "1" for p in mutable)
+        assert ready_shards[0] not in mutable
+
+    @pytest.mark.asyncio
+    async def test_seal_refuses_empty_parquet(
+        self,
+        temp_dir: Path,
+        sample_span: Span,
+    ) -> None:
+        store = ParquetStore(
+            output_dir=temp_dir / "data",
+            buffer_size=10,
+            trajectory_buffer_size=30,
+            auto_flush=False,
+            enable_workflow_trigger=False,
+        )
+        await store.add_span(
+            Span(
+                name="orphan",
+                context=sample_span.context,
+                start_time=1.0,
+                rollout_id="orphan",
+                attempt_id=sample_span.attempt_id,
+            )
+        )
+        # Simulate meta saying we collected without a successful flush.
+        store._span_buffer.clear()
+        store._current_batch_collected = 5
+        store._write_batch_meta(0, state="collecting", collected=5)
+        sealed = await store.seal_current_batch(schedule_workflow=False)
+        assert sealed is None
+        meta = store._read_batch_meta(0)
+        assert str(meta.get("state")) == "collecting"
