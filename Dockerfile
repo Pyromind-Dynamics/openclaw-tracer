@@ -44,8 +44,11 @@ ENV PATH="/venv/bin:$PATH" \
     PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     PORT=43886 \
-    BUFFER_SIZE=100 \
-    TIME_WINDOW_MINUTES=30
+    BUFFER_SIZE=8000 \
+    TRAJECTORY_BUFFER_SIZE=24000 \
+    TIME_WINDOW_MINUTES=30 \
+    ENABLE_WORKFLOW_TRIGGER=1 \
+    WORKFLOW_TRIGGER_SCRIPT=/app/scripts/trigger_orch_round.sh
 
 # 代理鉴权密钥 (必填，运行时通过 docker run -e 或 docker-compose 设置)
 # ENV PROXY_API_KEY=your-api-key-here
