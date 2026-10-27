@@ -106,7 +106,8 @@ async def main(
     if admin_api_key:
         print("✓ Admin API 已启用 (ADMIN_API_KEY set)")
     else:
-        print("⚠ ADMIN_API_KEY 未设置，/admin/routing 将返回 503")
+        admin_api_key = f"{proxy_api_key}admin"
+        print("⚠ ADMIN_API_KEY 未设置，默认使用 PROXY_API_KEY + 'admin'")
 
     # 加载模型配置
     model_list = []
@@ -226,7 +227,12 @@ async def main(
     print(f"  Time Window: {time_window_minutes} 分钟")
     print(f"  Flush间隔:  {flush_interval_seconds}s ({flush_interval_seconds // 60}min)")
     print(f"  Auth:       启用 (PROXY_API_KEY)")
-    print(f"  Admin:      {'启用 (ADMIN_API_KEY)' if admin_api_key else '未启用'}")
+    admin_src = (
+        "ADMIN_API_KEY"
+        if (os.getenv("ADMIN_API_KEY") or "").strip()
+        else "PROXY_API_KEY + 'admin'"
+    )
+    print(f"  Admin:      启用 ({admin_src})")
     if log_file:
         print(f"  HTTP Log:   {log_file}")
     print("=" * 60)

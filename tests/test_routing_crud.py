@@ -228,6 +228,48 @@ def test_admin_disabled_without_key(tmp_path: Path) -> None:
     assert r.status_code == 503
 
 
+def test_llm_proxy_defaults_admin_key_from_proxy(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from openclaw_tracer.proxy.llm_proxy import LLMProxy
+    from openclaw_tracer.storage.parquet_store import ParquetStore
+
+    monkeypatch.delenv("ADMIN_API_KEY", raising=False)
+    store = ParquetStore(
+        output_dir=tmp_path / "data",
+        buffer_size=10,
+        time_window_minutes=9999,
+    )
+    proxy = LLMProxy(
+        port=0,
+        model_list=[_dep("m1", "http://a", dep_id="a")],
+        store=store,
+        proxy_api_key="proxy-secret",
+        admin_api_key=None,
+        routing_state_path=tmp_path / "data" / "routing_state.json",
+    )
+    assert proxy.admin_api_key == "proxy-secretadmin"
+
+
+def test_default_admin_key_works_for_routing(tmp_path: Path) -> None:
+    proxy = FakeProxy(
+        [_dep("m1", "http://a")],
+        admin_api_key="proxy-secretadmin",
+        state_path=tmp_path / "rs.json",
+    )
+    client = TestClient(_admin_app(proxy))
+    r = client.get(
+        "/admin/routing",
+        headers={"Authorization": "Bearer proxy-secretadmin"},
+    )
+    assert r.status_code == 200
+    assert r.json()["ok"] is True
+    # PROXY_API_KEY alone still rejected
+    r2 = client.get(
+        "/admin/routing",
+        headers={"Authorization": "Bearer proxy-secret"},
+    )
+    assert r2.status_code == 401
+
+
 def test_create_and_delete_keeps_logical_model_name(tmp_path: Path) -> None:
     proxy = FakeProxy(
         [_dep("pcb_avi_sft_merge_v10", "http://old", weight=100, dep_id="old-id")],

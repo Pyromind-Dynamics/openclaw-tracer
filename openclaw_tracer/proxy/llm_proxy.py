@@ -1072,7 +1072,8 @@ class LLMProxy:
             log_file: Path to HTTP access log file (JSONL format).
             proxy_api_key: API key for proxy authentication. Required.
             task_timeout_minutes: Minutes of inactivity before a task is cleaned up.
-            admin_api_key: Separate key for /admin/routing APIs (optional).
+            admin_api_key: Key for /admin/** APIs. If unset, defaults to
+                ``proxy_api_key + "admin"`` (with a warning).
             routing_state_path: Optional path for persisted routing state.
         """
         from openclaw_tracer.routing_state import (
@@ -1136,10 +1137,17 @@ class LLMProxy:
             self.auth_middleware = None
             logger.warning("[Auth] No PROXY_API_KEY provided, running without authentication")
 
-        if self.admin_api_key:
+        if not self.admin_api_key and proxy_api_key:
+            self.admin_api_key = f"{proxy_api_key}admin"
+            logger.warning(
+                "[Auth] ADMIN_API_KEY not set; defaulting to PROXY_API_KEY + 'admin'"
+            )
+        elif self.admin_api_key:
             logger.info("[Auth] Admin API enabled (ADMIN_API_KEY set)")
         else:
-            logger.warning("[Auth] ADMIN_API_KEY not set; /admin/routing will return 503")
+            logger.warning(
+                "[Auth] ADMIN_API_KEY not set and no PROXY_API_KEY; /admin will return 503"
+            )
 
         # Task Manager for session management
         self.task_manager = TaskManager(timeout_minutes=task_timeout_minutes)

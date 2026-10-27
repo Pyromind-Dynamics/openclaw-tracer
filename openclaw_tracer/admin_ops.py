@@ -226,9 +226,119 @@ def register_admin_ops_routes(fastapi_app: Any, proxy: Any) -> None:
             )
         return JSONResponse({"ok": True, **result})
 
+    @fastapi_app.get("/admin/config")
+    async def get_config(request: Request) -> JSONResponse:
+        """Read runtime knobs: buffer_size, trajectory_buffer_size, workflow_trigger_script."""
+        err = await _require_admin(request, admin_key)
+        if err:
+            return err
+        if not isinstance(store, ParquetStore):
+            return JSONResponse(
+                {"error": "runtime config requires ParquetStore"},
+                status_code=501,
+            )
+        return JSONResponse({"ok": True, **store.get_runtime_config()})
+
+    @fastapi_app.patch("/admin/config")
+    async def patch_config(request: Request) -> JSONResponse:
+        """Hot-update runtime knobs (partial body).
+
+        Accepted JSON fields (all optional)::
+
+            {
+              "buffer_size": 8000,
+              "trajectory_buffer_size": 24000,
+              "workflow_trigger_script": "/app/trigger/run.sh"
+            }
+
+        Aliases: ``BUFFER_SIZE``, ``TRAJECTORY_BUFFER_SIZE``, ``WORKFLOW_TRIGGER_SCRIPT``.
+        """
+        err = await _require_admin(request, admin_key)
+        if err:
+            return err
+        if not isinstance(store, ParquetStore):
+            return JSONResponse(
+                {"error": "runtime config requires ParquetStore"},
+                status_code=501,
+            )
+        try:
+            body = await request.json()
+        except Exception:  # noqa: BLE001
+            body = None
+        if not isinstance(body, dict) or not body:
+            return JSONResponse(
+                {
+                    "error": "JSON body required with at least one of: "
+                    "buffer_size, trajectory_buffer_size, workflow_trigger_script",
+                    "code": "invalid_config",
+                },
+                status_code=400,
+            )
+
+        kwargs: Dict[str, Any] = {}
+        if "buffer_size" in body or "BUFFER_SIZE" in body:
+            raw = body["buffer_size"] if "buffer_size" in body else body["BUFFER_SIZE"]
+            try:
+                kwargs["buffer_size"] = int(raw)
+            except (TypeError, ValueError):
+                return JSONResponse(
+                    {"error": "buffer_size must be an integer", "code": "invalid_config"},
+                    status_code=400,
+                )
+        if "trajectory_buffer_size" in body or "TRAJECTORY_BUFFER_SIZE" in body:
+            raw = (
+                body["trajectory_buffer_size"]
+                if "trajectory_buffer_size" in body
+                else body["TRAJECTORY_BUFFER_SIZE"]
+            )
+            try:
+                kwargs["trajectory_buffer_size"] = int(raw)
+            except (TypeError, ValueError):
+                return JSONResponse(
+                    {
+                        "error": "trajectory_buffer_size must be an integer",
+                        "code": "invalid_config",
+                    },
+                    status_code=400,
+                )
+        if "workflow_trigger_script" in body or "WORKFLOW_TRIGGER_SCRIPT" in body:
+            raw = (
+                body["workflow_trigger_script"]
+                if "workflow_trigger_script" in body
+                else body["WORKFLOW_TRIGGER_SCRIPT"]
+            )
+            if raw is None or not str(raw).strip():
+                return JSONResponse(
+                    {
+                        "error": "workflow_trigger_script must be a non-empty path",
+                        "code": "invalid_config",
+                    },
+                    status_code=400,
+                )
+            kwargs["workflow_trigger_script"] = str(raw).strip()
+
+        if not kwargs:
+            return JSONResponse(
+                {
+                    "error": "no recognized fields; use buffer_size, "
+                    "trajectory_buffer_size, and/or workflow_trigger_script",
+                    "code": "invalid_config",
+                },
+                status_code=400,
+            )
+
+        try:
+            config = store.update_runtime_config(**kwargs)
+        except ValueError as exc:
+            return JSONResponse(
+                {"error": str(exc), "code": "invalid_config"},
+                status_code=400,
+            )
+        return JSONResponse({"ok": True, **config})
+
     fastapi_app.state.openclaw_admin_ops_registered = True
     logger.info(
-        "[AdminOps] Registered /admin/flush, /admin/batches and /admin/spans/release "
-        "(enabled=%s)",
+        "[AdminOps] Registered /admin/flush, /admin/batches, /admin/spans/release, "
+        "/admin/config (enabled=%s)",
         bool(admin_key),
     )

@@ -1335,6 +1335,129 @@ class ParquetStore(StorageBackend):
             "batch_mode": False,
         }
 
+    def get_runtime_config(self) -> Dict[str, Any]:
+        """Return admin-tunable runtime knobs (EchoMind / orch hot config)."""
+        return {
+            "buffer_size": self.buffer_size,
+            "trajectory_buffer_size": self.trajectory_buffer_size,
+            "workflow_trigger_script": str(self._workflow_trigger_script_path),
+            "enable_workflow_trigger": self._workflow_trigger_enabled,
+            "batch_mode": self._batch_mode,
+            "max_batch_slots": self._max_batch_slots(),
+        }
+
+    def update_runtime_config(
+        self,
+        *,
+        buffer_size: Optional[int] = None,
+        trajectory_buffer_size: Optional[int] = None,
+        workflow_trigger_script: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Hot-update BUFFER_SIZE / TRAJECTORY_BUFFER_SIZE / WORKFLOW_TRIGGER_SCRIPT.
+
+        Partial updates allowed. Validates cross-field constraints against the
+        post-update values. Raises ``ValueError`` on invalid input.
+        """
+        new_buffer = self.buffer_size if buffer_size is None else int(buffer_size)
+        new_traj = (
+            self.trajectory_buffer_size
+            if trajectory_buffer_size is None
+            else int(trajectory_buffer_size)
+        )
+
+        if buffer_size is not None and new_buffer < 1:
+            raise ValueError("buffer_size must be >= 1")
+        if trajectory_buffer_size is not None and new_traj < 0:
+            raise ValueError("trajectory_buffer_size must be >= 0")
+        if new_traj > 0 and new_buffer < 1:
+            raise ValueError("buffer_size must be >= 1 when trajectory_buffer_size > 0")
+        if new_traj > 0 and new_traj < new_buffer:
+            raise ValueError(
+                f"trajectory_buffer_size ({new_traj}) must be >= buffer_size ({new_buffer})"
+            )
+
+        if (
+            self._batch_mode
+            and new_traj == 0
+            and trajectory_buffer_size is not None
+        ):
+            batches_info = self.list_batches()
+            held_inflight = int(batches_info.get("inflight_count") or 0)
+            if held_inflight > 0:
+                raise ValueError(
+                    "cannot set trajectory_buffer_size=0 while ready/in_training "
+                    f"batches remain (inflight_count={held_inflight}); release first"
+                )
+
+        changed: Dict[str, Any] = {}
+
+        if workflow_trigger_script is not None:
+            path = resolve_workflow_script_path(str(workflow_trigger_script).strip())
+            self._workflow_trigger_script_path = path
+            os.environ["WORKFLOW_TRIGGER_SCRIPT"] = str(path)
+            changed["workflow_trigger_script"] = str(path)
+
+        if buffer_size is not None and new_buffer != self.buffer_size:
+            self.buffer_size = new_buffer
+            os.environ["BUFFER_SIZE"] = str(new_buffer)
+            changed["buffer_size"] = new_buffer
+            if self.trajectory_buffer_size > 0 and new_buffer > 1:
+                self._flush_chunk_size = max(1, min(500, new_buffer // 8 or 1))
+            else:
+                self._flush_chunk_size = max(1, new_buffer)
+
+        if trajectory_buffer_size is not None and new_traj != self.trajectory_buffer_size:
+            enabling = not self._batch_mode and new_traj > 0
+            disabling = self._batch_mode and new_traj == 0
+            self.trajectory_buffer_size = new_traj
+            os.environ["TRAJECTORY_BUFFER_SIZE"] = str(new_traj)
+            changed["trajectory_buffer_size"] = new_traj
+
+            if enabling:
+                self._batch_mode = True
+                spans_dir = self.output_dir / "spans"
+                spans_dir.mkdir(exist_ok=True)
+                self._restore_batch_state(spans_dir)
+                self._write_batch_meta(
+                    self._current_batch_index,
+                    state=(
+                        "ready"
+                        if self._current_batch_collected >= self.buffer_size
+                        else "collecting"
+                    ),
+                    collected=self._current_batch_collected,
+                )
+                if self.buffer_size > 1:
+                    self._flush_chunk_size = max(1, min(500, self.buffer_size // 8 or 1))
+                changed["batch_mode"] = True
+            elif disabling:
+                self._batch_mode = False
+                changed["batch_mode"] = False
+
+        if self._batch_mode and (
+            "buffer_size" in changed or "trajectory_buffer_size" in changed
+        ):
+            # Refresh live collecting meta so status/list_batches see new buffer_size.
+            state = (
+                "ready"
+                if self._current_batch_collected >= self.buffer_size
+                else "collecting"
+            )
+            meta = self._read_batch_meta(self._current_batch_index)
+            if meta.get("state") in (None, "collecting", "ready") and meta.get(
+                "state"
+            ) != "in_training":
+                if meta.get("state") == "ready":
+                    state = "ready"
+                self._write_batch_meta(
+                    self._current_batch_index,
+                    state=state,
+                    collected=self._current_batch_collected,
+                )
+
+        logger.info("[ParquetStore] runtime config updated: %s", changed or "(no-op)")
+        return self.get_runtime_config()
+
     def _span_to_dict(self, span: Span) -> Dict[str, Any]:
         """Convert a Span object to a dictionary for Parquet storage."""
         return {
