@@ -102,6 +102,12 @@ async def main(
 
     print(f"✓ 代理鉴权已启用 (PROXY_API_KEY: {proxy_api_key[:8]}...)")
 
+    # LiteLLM refuses to boot without a master key; default to PROXY_API_KEY so
+    # EchoMind / k8s deployments that only inject PROXY_API_KEY still start.
+    if not (os.getenv("LITELLM_MASTER_KEY") or "").strip():
+        os.environ["LITELLM_MASTER_KEY"] = proxy_api_key
+        print("⚠ LITELLM_MASTER_KEY 未设置，默认与 PROXY_API_KEY 相同")
+
     admin_api_key = (os.getenv("ADMIN_API_KEY") or "").strip() or None
     if admin_api_key:
         print("✓ Admin API 已启用 (ADMIN_API_KEY set)")

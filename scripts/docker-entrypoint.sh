@@ -8,6 +8,17 @@ if [ -z "${PROXY_API_KEY}" ]; then
     exit 1
 fi
 
+# LiteLLM 强制要求 master key；未显式设置时与 PROXY_API_KEY 对齐（EchoMind / k8s 常只注入后者）
+if [ -z "${LITELLM_MASTER_KEY}" ]; then
+    export LITELLM_MASTER_KEY="${PROXY_API_KEY}"
+    echo "⚠ LITELLM_MASTER_KEY 未设置，默认与 PROXY_API_KEY 相同"
+fi
+
+# Prefer the image venv even if PATH was stripped by the orchestrator.
+if [ -x /venv/bin/python ]; then
+    export PATH="/venv/bin:${PATH}"
+fi
+
 # 确定配置文件路径
 # 优先级: 用户挂载的 /app/config/models.json > 内置空配置
 if [ -f /app/config/models.json ]; then

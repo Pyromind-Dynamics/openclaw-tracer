@@ -117,6 +117,7 @@ docker-compose up -d
 | 变量 | 是否必填 | 说明 |
 |------|----------|------|
 | `PROXY_API_KEY` | **是** | 代理服务的鉴权密钥 |
+| `LITELLM_MASTER_KEY` | 否 | LiteLLM 内置 master key。未设置时默认与 `PROXY_API_KEY` 相同 |
 | `ADMIN_API_KEY` | 否 | 用于全部 `/admin/**`（routing / flush / batches / config 等）。未设置时默认 `PROXY_API_KEY + "admin"` 并打印 warning；与 `PROXY_API_KEY` 本身仍互不通用 |
 
 **重要：** 如果未设置 `PROXY_API_KEY`，服务将无法启动。热切流与模型 CRUD 见 [docs/USAGE.md §9](docs/USAGE.md#9-热切流与模型-crud)。

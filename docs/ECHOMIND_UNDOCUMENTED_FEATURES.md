@@ -61,6 +61,7 @@ curl -X PATCH http://$TRACER/admin/config \
 |----|------|
 | `PROXY_API_KEY` | = 创建后下发的 `secret_key`；调 `/v1/*`、`/end_task` |
 | `ADMIN_API_KEY` | 全部 `/admin/**`（flush、batches、config、routing、spans）；未设则默认 `PROXY_API_KEY + "admin"` |
+| `LITELLM_MASTER_KEY` | LiteLLM 启动必需；未设则默认与 `PROXY_API_KEY` 相同（entrypoint / `serve.py`） |
 | `WORKFLOW_TRIGGER_SCRIPT` | = `custom_runtime_script_path`；满批或 flush+trigger 时异步执行 |
 | `POST /admin/spans/release` | ADMIN；`TRAJECTORY_BUFFER_SIZE=0` 时按 shard 释放 |
 
