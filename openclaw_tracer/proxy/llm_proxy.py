@@ -630,7 +630,7 @@ class SpanLogger(CustomLogger):
             # Get task context from contextvars
             ctx = task_context.get() or {}
             if ctx.get("no_trace"):
-                logger.debug("Skipping span capture due to X-Task-No-Trace")
+                logger.debug("Skipping span capture (no X-Task-Trace opt-in)")
                 return
             task_id = ctx.get("task_id")
             attempt_id = ctx.get("attempt_id")
@@ -964,7 +964,7 @@ class SpanLogger(CustomLogger):
             # Get task context from contextvars
             ctx = task_context.get() or {}
             if ctx.get("no_trace"):
-                logger.debug("Skipping failure span capture due to X-Task-No-Trace")
+                logger.debug("Skipping failure span capture (no X-Task-Trace opt-in)")
                 return
             task_id = ctx.get("task_id")
             attempt_id = ctx.get("attempt_id")
@@ -1594,7 +1594,7 @@ class LLMProxy:
                 "features": [
                     "task-tracking",
                     "reward-tracking",
-                    "no-trace-header",
+                    "trace-header",
                     "flush-api",
                 ],
             }

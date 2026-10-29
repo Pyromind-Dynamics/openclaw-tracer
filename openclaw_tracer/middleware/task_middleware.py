@@ -15,19 +15,24 @@ logger = logging.getLogger(__name__)
 class TaskMiddleware(BaseHTTPMiddleware):
     """Middleware to extract task information and manage sessions.
 
-    Extracts X-Task-ID, X-Previous-Reward, and X-Task-No-Trace headers,
+    Extracts X-Task-ID, X-Previous-Reward, and X-Task-Trace headers,
     interacts with TaskManager to get/create attempt_id, and stores in
     request.state / task_context.
+
+    Tracing is **opt-in**: spans are written only when ``X-Task-Trace`` is a
+    truthy flag (``1`` / ``true`` / ``yes`` / ``on``). Otherwise the request is
+    still proxied upstream but no span is persisted (``no_trace=True``).
     """
 
     HEADER_TASK_ID = "x-task-id"
     HEADER_PREVIOUS_REWARD = "x-previous-reward"
-    HEADER_NO_TRACE = "x-task-no-trace"
+    HEADER_TRACE = "x-task-trace"
 
     # Keys for storing in request.state
     STATE_TASK_ID = "task_id"
     STATE_ATTEMPT_ID = "attempt_id"
     STATE_PREVIOUS_REWARD = "previous_reward"
+    STATE_DO_TRACE = "do_trace"
     STATE_NO_TRACE = "no_trace"
 
     def __init__(self, app, task_manager: TaskManager):
@@ -54,7 +59,9 @@ class TaskMiddleware(BaseHTTPMiddleware):
         headers = dict(request.headers)
         task_id = self._extract_header(headers, self.HEADER_TASK_ID)
         previous_reward = self._extract_reward_header(headers, self.HEADER_PREVIOUS_REWARD)
-        no_trace = self._extract_bool_header(headers, self.HEADER_NO_TRACE)
+        do_trace = self._extract_bool_header(headers, self.HEADER_TRACE)
+        # Internal skip flag used by llm_proxy (default: skip unless opted in).
+        no_trace = not do_trace
 
         # Get or create attempt from TaskManager
         final_task_id, attempt_id = await self.task_manager.get_or_create_attempt(task_id)
@@ -63,6 +70,7 @@ class TaskMiddleware(BaseHTTPMiddleware):
         request.state[self.STATE_TASK_ID] = final_task_id
         request.state[self.STATE_ATTEMPT_ID] = attempt_id
         request.state[self.STATE_PREVIOUS_REWARD] = previous_reward
+        request.state[self.STATE_DO_TRACE] = do_trace
         request.state[self.STATE_NO_TRACE] = no_trace
 
         # Store to context variable (so SpanLogger can access it via contextvars)
@@ -70,6 +78,7 @@ class TaskMiddleware(BaseHTTPMiddleware):
             "task_id": final_task_id,
             "attempt_id": attempt_id,
             "previous_reward": previous_reward,
+            "do_trace": do_trace,
             "no_trace": no_trace,
         }
         token = task_context.set(context_data)
@@ -77,7 +86,7 @@ class TaskMiddleware(BaseHTTPMiddleware):
         logger.debug(
             f"[TaskMiddleware] task_id={final_task_id}, "
             f"attempt_id={attempt_id}, previous_reward={previous_reward}, "
-            f"no_trace={no_trace}"
+            f"do_trace={do_trace}, no_trace={no_trace}"
         )
 
         try:

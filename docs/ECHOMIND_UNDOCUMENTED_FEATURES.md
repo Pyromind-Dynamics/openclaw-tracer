@@ -87,7 +87,7 @@ curl -X PATCH http://$TRACER/admin/config \
 |----|------|------|
 | Header `X-Task-ID` | PROXY | → `rollout_id` |
 | Header `X-Previous-Reward` | PROXY | 逐步 reward |
-| Header `X-Task-No-Trace` | PROXY | 转发不落盘 |
+| Header `X-Task-Trace` | PROXY | **opt-in 落盘**；缺省只转发不写 span |
 | `POST /end_task` | PROXY | `final_reward` / `gt` |
 | `GET /tracer-version` | — | 版本探测 |
 

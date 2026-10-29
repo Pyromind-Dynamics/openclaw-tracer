@@ -399,15 +399,18 @@ OpenClaw-Tracer supports task tracking and reward-signal capture for RL training
 |--------|------|----------|-------------|
 | `X-Task-ID` | string | No | Task identifier, used as `rollout_id` |
 | `X-Previous-Reward` | float | No | Reward value from the previous step |
-| `X-Task-No-Trace` | bool | No | If `1` / `true` / `yes` / `on`, proxy the request but **do not** write a span to storage |
+| `X-Task-Trace` | bool | No | **Opt-in tracing**: if `1` / `true` / `yes` / `on`, persist a span; otherwise proxy only (no span) |
 
 ### Example
+
+Persist a span (training / agent feed) — set `X-Task-Trace`:
 
 ```bash
 curl http://localhost:43886/v1/chat/completions \
   -H "Content-Type: application/json" \
   -H "Authorization: Bearer your-proxy-key" \
   -H "X-Task-ID: my-task-123" \
+  -H "X-Task-Trace: true" \
   -H "X-Previous-Reward: 0.85" \
   -d '{
     "model": "gpt-4",
@@ -415,12 +418,11 @@ curl http://localhost:43886/v1/chat/completions \
   }'
 ```
 
-Skip tracing for a single request:
+Default is proxy-only (no span) — useful for health / eval traffic:
 
 ```bash
 curl http://localhost:43886/v1/chat/completions \
   -H "Authorization: Bearer your-proxy-key" \
-  -H "X-Task-No-Trace: true" \
   -H "Content-Type: application/json" \
   -d '{"model":"gpt-4","messages":[{"role":"user","content":"ping"}]}'
 ```

@@ -1,5 +1,5 @@
 # Copyright (c) 2025 OpenClaw-Tracer
-# Tests for X-Task-No-Trace parsing, flush API helper, and data-delete callbacks.
+# Tests for X-Task-Trace parsing, flush API helper, and data-delete callbacks.
 
 from __future__ import annotations
 
@@ -24,13 +24,42 @@ from openclaw_tracer.types.core import (
 )
 
 
-def test_extract_no_trace_truthy() -> None:
+def test_extract_trace_truthy() -> None:
     mw = TaskMiddleware(app=MagicMock(), task_manager=MagicMock())
-    assert mw._extract_bool_header({"X-Task-No-Trace": "true"}, "x-task-no-trace") is True
-    assert mw._extract_bool_header({"x-task-no-trace": "1"}, "x-task-no-trace") is True
-    assert mw._extract_bool_header({"x-task-no-trace": "yes"}, "x-task-no-trace") is True
-    assert mw._extract_bool_header({"x-task-no-trace": "0"}, "x-task-no-trace") is False
-    assert mw._extract_bool_header({}, "x-task-no-trace") is False
+    assert mw._extract_bool_header({"X-Task-Trace": "true"}, "x-task-trace") is True
+    assert mw._extract_bool_header({"x-task-trace": "1"}, "x-task-trace") is True
+    assert mw._extract_bool_header({"x-task-trace": "yes"}, "x-task-trace") is True
+    assert mw._extract_bool_header({"x-task-trace": "0"}, "x-task-trace") is False
+    assert mw._extract_bool_header({}, "x-task-trace") is False
+
+
+@pytest.mark.asyncio
+async def test_trace_header_opt_in_defaults_to_no_trace() -> None:
+    """Without X-Task-Trace, middleware sets no_trace=True (proxy-only)."""
+
+    async def _attempt(task_id):  # noqa: ANN001
+        return (task_id or "anon", "attempt-1")
+
+    tm = MagicMock()
+    tm.get_or_create_attempt = _attempt
+    mw = TaskMiddleware(app=MagicMock(), task_manager=tm)
+
+    async def _call_next(_request):  # noqa: ANN001
+        return MagicMock(status_code=200)
+
+    req = MagicMock()
+    req.headers = {"x-task-id": "t1"}
+    req.state = {}
+    await mw.dispatch(req, _call_next)
+    assert req.state.get("do_trace") is False
+    assert req.state.get("no_trace") is True
+
+    req2 = MagicMock()
+    req2.headers = {"x-task-id": "t2", "x-task-trace": "true"}
+    req2.state = {}
+    await mw.dispatch(req2, _call_next)
+    assert req2.state.get("do_trace") is True
+    assert req2.state.get("no_trace") is False
 
 
 @pytest.mark.asyncio

@@ -402,15 +402,18 @@ OpenClaw-Tracer 支持 task 追踪和奖励信号捕获，用于 RL 训练数据
 |--------|------|------|------|
 | `X-Task-ID` | string | 否 | 任务标识符，用作 `rollout_id` |
 | `X-Previous-Reward` | float | 否 | 上一步的奖励值 |
-| `X-Task-No-Trace` | bool | 否 | 为 `1`/`true`/`yes`/`on` 时仍转发上游，但**不落盘** span |
+| `X-Task-Trace` | bool | 否 | **落盘开关（opt-in）**：为 `1`/`true`/`yes`/`on` 时才写 span；缺省或假值仍转发上游，但不落盘 |
 
 ### 示例
+
+需要落盘（训练 / Agent 灌数）时加上 `X-Task-Trace`：
 
 ```bash
 curl http://localhost:43886/v1/chat/completions \
   -H "Content-Type: application/json" \
   -H "Authorization: Bearer your-proxy-key" \
   -H "X-Task-ID: my-task-123" \
+  -H "X-Task-Trace: true" \
   -H "X-Previous-Reward: 0.85" \
   -d '{
     "model": "gpt-4",
@@ -418,12 +421,11 @@ curl http://localhost:43886/v1/chat/completions \
   }'
 ```
 
-单次请求不落盘：
+默认不落盘（只转发，适合探活 / 评测）：
 
 ```bash
 curl http://localhost:43886/v1/chat/completions \
   -H "Authorization: Bearer your-proxy-key" \
-  -H "X-Task-No-Trace: true" \
   -H "Content-Type: application/json" \
   -d '{"model":"gpt-4","messages":[{"role":"user","content":"ping"}]}'
 ```

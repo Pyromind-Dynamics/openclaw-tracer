@@ -673,7 +673,10 @@ class TestApplyRolloutFinalReward:
         rid = "task-with-final-reward"
         span = sample_span.model_copy(update={"rollout_id": rid})
         await store.add_span(span)
+        # end_task only updates pending when the span already flushed; drain
+        # (flush/seal) coalesces parquet rewrites.
         await store.apply_rollout_final_reward(rid, 0.875)
+        await store.drain_pending_rollout_patches()
 
         spans_dir = temp_dir / "data" / "spans"
         parquet_files = list(spans_dir.glob("*.parquet"))
@@ -705,6 +708,42 @@ class TestApplyRolloutFinalReward:
         assert len(parquet_files) == 1
         df = pd.read_parquet(parquet_files[0])
         assert float(df["final_reward"].iloc[0]) == pytest.approx(-0.25)
+
+    @pytest.mark.asyncio
+    async def test_end_task_defers_parquet_until_drain(
+        self,
+        temp_dir: Path,
+        sample_span: Span,
+    ) -> None:
+        """Many end_tasks must not rewrite parquet until drain/flush."""
+        store = ParquetStore(
+            output_dir=temp_dir / "data",
+            buffer_size=1,
+            auto_flush=True,
+            enable_workflow_trigger=False,
+        )
+        rids = [f"defer-{i}" for i in range(5)]
+        for i, rid in enumerate(rids):
+            span = sample_span.model_copy(
+                update={"rollout_id": rid, "start_time": 10.0 + i}
+            )
+            await store.add_span(span)
+        spans_dir = temp_dir / "data" / "spans"
+        shard = next(spans_dir.glob("*.parquet"))
+        before = shard.stat().st_mtime_ns
+        for i, rid in enumerate(rids):
+            await store.apply_rollout_final_reward(rid, float(i) / 10.0)
+        assert shard.stat().st_mtime_ns == before
+        assert len(store._pending_final_reward) == 5
+        await store.drain_pending_rollout_patches()
+        assert not store._pending_final_reward
+        df = pd.read_parquet(shard)
+        by_id = {
+            str(r): float(v)
+            for r, v in zip(df["rollout_id"].astype(str), df["final_reward"])
+        }
+        for i, rid in enumerate(rids):
+            assert by_id[rid] == pytest.approx(float(i) / 10.0)
 
 
     @pytest.mark.asyncio
