@@ -92,8 +92,6 @@ async def test_full_batch_held_until_release(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Full batches stay on disk until admin release; no auto-delete on advance."""
-    from openclaw_tracer.storage.parquet_store import BatchCapacityFull
-
     monkeypatch.setenv("DATA_DELETE_CALLBACK_URL", "http://callback.test/del")
     monkeypatch.delenv("DATA_DELETE_CALLBACK_SCRIPT", raising=False)
 
@@ -135,9 +133,13 @@ async def test_full_batch_held_until_release(
     assert inventory["ready_count"] >= 1
     assert any(b["index"] == 0 and b["state"] == "ready" for b in inventory["batches"])
 
-    # Third batch would need a new slot → capacity full
-    with pytest.raises(BatchCapacityFull):
-        await store.add_span(make_span(99))
+    # Third batch would need a new slot → capacity full; public add_span skips
+    # (no raise) so chat/inference stays 200.
+    before_held = store.get_collection_status()["held"]
+    await store.add_span(make_span(99))
+    status = store.get_collection_status()
+    assert status["held"] == before_held
+    assert store._current_batch_index == 1
 
     with patch(
         "openclaw_tracer.data_callback.schedule_data_delete_callback", capture

@@ -999,3 +999,103 @@ class TestBatchParquetHardening:
         assert sealed is None
         meta = store._read_batch_meta(0)
         assert str(meta.get("state")) == "collecting"
+
+    @pytest.mark.asyncio
+    async def test_seal_refuse_does_not_bloat_past_buffer_size(
+        self,
+        temp_dir: Path,
+        sample_span: Span,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """When seal cannot land parquet, stop recording — do not grow past seal_at.
+
+        Regression: JuiceFS/empty-parquet seal refusal returned None while
+        ``_add_span_impl`` kept ``collected += 1``, blowing held ≫ capacity
+        (e.g. 45k on an 8k seal_at batch).
+        """
+        buffer_size = 4
+        store = ParquetStore(
+            output_dir=temp_dir / "data",
+            buffer_size=buffer_size,
+            trajectory_buffer_size=12,
+            auto_flush=False,
+            enable_workflow_trigger=False,
+        )
+        # Counter at seal_at; disk reads always empty (JuiceFS lag / ENOENT).
+        store._span_buffer.clear()
+        store._current_batch_collected = buffer_size
+        store._write_batch_meta(0, state="collecting", collected=buffer_size)
+        monkeypatch.setattr(store, "_count_parquet_rows", lambda _files: 0)
+        assert await store.seal_current_batch(schedule_workflow=False) is None
+
+        for i in range(20):
+            await store.add_span(
+                Span(
+                    name=f"overflow.{i}",
+                    context=sample_span.context,
+                    start_time=100.0 + i,
+                    rollout_id=f"overflow-{i}",
+                    attempt_id=sample_span.attempt_id,
+                )
+            )
+
+        status = store.get_collection_status()
+        assert store._current_batch_collected == buffer_size
+        assert int(status["collected_data_size"]) == buffer_size
+        assert int(status["held"]) == buffer_size
+        assert store._current_batch_index == 0
+        meta = store._read_batch_meta(0)
+        assert str(meta.get("state")) == "collecting"
+        assert int(meta.get("collected") or 0) == buffer_size
+        # Overflow traffic must not accumulate in the in-memory buffer either.
+        assert store._span_buffer == []
+
+    @pytest.mark.asyncio
+    async def test_seal_recovers_after_parquet_becomes_readable(
+        self,
+        temp_dir: Path,
+        sample_span: Span,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """After a refuse, a later flush+seal must still advance once disk has rows."""
+        buffer_size = 3
+        store = ParquetStore(
+            output_dir=temp_dir / "data",
+            buffer_size=buffer_size,
+            trajectory_buffer_size=9,
+            auto_flush=False,
+            enable_workflow_trigger=False,
+        )
+        store._current_batch_collected = buffer_size
+        store._write_batch_meta(0, state="collecting", collected=buffer_size)
+
+        visible = {"ok": False}
+        real_count = store._count_parquet_rows
+
+        def flaky_count(files: list) -> int:
+            if not visible["ok"]:
+                return 0
+            return real_count(files)
+
+        monkeypatch.setattr(store, "_count_parquet_rows", flaky_count)
+        assert await store.seal_current_batch(schedule_workflow=False) is None
+
+        for i in range(buffer_size):
+            store._span_buffer.append(
+                store._span_to_dict(
+                    Span(
+                        name=f"lag.{i}",
+                        context=sample_span.context,
+                        start_time=1.0 + i,
+                        rollout_id=f"lag-{i}",
+                        attempt_id=sample_span.attempt_id,
+                    )
+                )
+            )
+        await store._flush_spans(schedule_workflow=False)
+        visible["ok"] = True
+        sealed = await store.seal_current_batch(schedule_workflow=False)
+        assert sealed == 0
+        assert store._current_batch_index == 1
+        assert store._current_batch_collected == 0
+        assert str(store._read_batch_meta(0).get("state")) == "ready"

@@ -212,6 +212,29 @@ class TestTaskTrackingIntegration:
         assert data.get("final_reward") is None
 
     @pytest.mark.asyncio
+    async def test_session_id_alias_create_and_end(
+        self, authenticated_client: AsyncClient, proxy_with_task_tracking: LLMProxy
+    ):
+        """``X-Session-Id`` creates the same task session as ``X-Task-ID``."""
+        task_id = "integration-session-alias-task"
+        response = await authenticated_client.get(
+            "/v1/models",
+            headers={"X-Session-Id": task_id},
+        )
+        assert response.status_code == 200
+        await asyncio.sleep(0.1)
+
+        end_response = await authenticated_client.post(
+            "/end_task",
+            json={"task_id": task_id},
+        )
+        assert end_response.status_code == 200
+        data = end_response.json()
+        assert data["task_id"] == task_id
+        assert data["attempt_count"] >= 1
+        assert data["total_requests"] >= 1
+
+    @pytest.mark.asyncio
     async def test_end_task_with_final_reward(self, authenticated_client: AsyncClient):
         """POST /end_task accepts final_reward (and alias reward)."""
         task_id = "integration-final-reward-task"

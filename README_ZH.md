@@ -401,6 +401,7 @@ OpenClaw-Tracer 支持 task 追踪和奖励信号捕获，用于 RL 训练数据
 | 请求头 | 类型 | 必填 | 描述 |
 |--------|------|------|------|
 | `X-Task-ID` | string | 否 | 任务标识符，用作 `rollout_id` |
+| `X-Session-Id` / `x-session-id` | string | 否 | `X-Task-ID` 的别名（同一 `rollout_id` 语义；大小写不敏感）。两者都带时以 `X-Task-ID` 为准 |
 | `X-Previous-Reward` | float | 否 | 上一步的奖励值 |
 | `X-Task-Trace` | bool | 否 | **落盘开关（opt-in）**：为 `1`/`true`/`yes`/`on` 时才写 span；缺省或假值仍转发上游，但不落盘 |
 

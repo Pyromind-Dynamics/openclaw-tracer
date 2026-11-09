@@ -557,8 +557,10 @@ class ParquetStore(StorageBackend):
         directory is opened immediately, then ``WORKFLOW_TRIGGER`` may fire.
         Ready batches are never auto-deleted; call ``release_batch`` after train.
 
-        If all trajectory slots are occupied, the span is **skipped** (logged)
-        and this method returns without raising — chat/inference must stay 200.
+        If all trajectory slots are occupied, or the collecting batch is at
+        ``buffer_size`` but seal cannot advance (e.g. parquet not readable yet),
+        the span is **skipped** (logged) and this method returns without raising
+        — chat/inference must stay 200.
         """
         try:
             await self._add_span_impl(span)
@@ -574,6 +576,18 @@ class ParquetStore(StorageBackend):
         # Stuck on a full/ready batch → finish seal (flush→ready→advance→trigger).
         if self._batch_mode and self._current_batch_collected >= self.buffer_size:
             await self.seal_current_batch(schedule_workflow=True)
+            # Seal refused (empty parquet / JuiceFS lag) or otherwise failed to
+            # open a new collecting slot: do NOT keep ``collected += 1`` or the
+            # batch blooms far past seal_at / capacity.
+            if self._current_batch_collected >= self.buffer_size:
+                logger.warning(
+                    "Skip span: collecting batch %s still full after seal attempt "
+                    "(collected=%s buffer_size=%s); not recording until seal advances",
+                    self._current_batch_index,
+                    self._current_batch_collected,
+                    self.buffer_size,
+                )
+                return
 
         span_dict = self._span_to_dict(span)
         self._apply_pending_to_span_dict(span_dict)
@@ -770,8 +784,8 @@ class ParquetStore(StorageBackend):
         if not parquet_files or disk_rows <= 0:
             logger.error(
                 "Refusing to seal batch %s: collected=%s but parquet missing/empty "
-                "(files=%s rows=%s) — keep collecting so export cannot claim an "
-                "empty ready batch (batch-0 regression)",
+                "(files=%s rows=%s) — skip further spans until parquet is readable "
+                "(avoid held ≫ seal_at / empty ready batch-0 regression)",
                 self._current_batch_index,
                 collected,
                 [str(p) for p in parquet_files],

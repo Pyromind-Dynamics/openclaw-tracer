@@ -147,3 +147,41 @@ class TestTaskMiddleware:
 
         await task_middleware.dispatch(request2, AsyncMock(side_effect=call_next2))
         assert request2.state.get("attempt_id") == "at-000002"
+
+    @pytest.mark.asyncio
+    async def test_session_id_lowercase_alias(self, task_middleware, task_manager):
+        """``x-session-id`` alone resolves the same as ``X-Task-ID``."""
+        request = MagicMock()
+        request.headers = {"x-session-id": "session-lower"}
+        request.state = {}
+
+        await task_middleware.dispatch(request, AsyncMock(return_value=MagicMock()))
+
+        assert request.state.get("task_id") == "session-lower"
+        assert request.state.get("attempt_id") == "at-000001"
+
+    @pytest.mark.asyncio
+    async def test_session_id_mixed_case_alias(self, task_middleware, task_manager):
+        """``X-Session-Id`` alone resolves the same as ``X-Task-ID``."""
+        request = MagicMock()
+        request.headers = {"X-Session-Id": "session-mixed"}
+        request.state = {}
+
+        await task_middleware.dispatch(request, AsyncMock(return_value=MagicMock()))
+
+        assert request.state.get("task_id") == "session-mixed"
+        assert request.state.get("attempt_id") == "at-000001"
+
+    @pytest.mark.asyncio
+    async def test_task_id_wins_over_session_id(self, task_middleware, task_manager):
+        """When both headers are set, ``X-Task-ID`` is canonical."""
+        request = MagicMock()
+        request.headers = {
+            "X-Task-ID": "from-task",
+            "X-Session-Id": "from-session",
+        }
+        request.state = {}
+
+        await task_middleware.dispatch(request, AsyncMock(return_value=MagicMock()))
+
+        assert request.state.get("task_id") == "from-task"

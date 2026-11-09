@@ -398,6 +398,7 @@ OpenClaw-Tracer supports task tracking and reward-signal capture for RL training
 | Header | Type | Required | Description |
 |--------|------|----------|-------------|
 | `X-Task-ID` | string | No | Task identifier, used as `rollout_id` |
+| `X-Session-Id` / `x-session-id` | string | No | Alias of `X-Task-ID` (same `rollout_id` semantics; case-insensitive). If both are set, `X-Task-ID` wins |
 | `X-Previous-Reward` | float | No | Reward value from the previous step |
 | `X-Task-Trace` | bool | No | **Opt-in tracing**: if `1` / `true` / `yes` / `on`, persist a span; otherwise proxy only (no span) |
 
