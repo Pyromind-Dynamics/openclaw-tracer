@@ -110,14 +110,15 @@ Create `config/models.json` with your model configurations:
 
 ### Environment Variables
 
-#### Proxy Authentication (Required)
+#### Proxy Authentication (Required at process start)
 
 | Variable | Required | Description |
 |----------|----------|-------------|
-| `PROXY_API_KEY` | **Yes** | API key for proxy authentication |
-| `ADMIN_API_KEY` | No | Admin key for `/admin/routing/**` only (hot switch / deployment CRUD). Not interchangeable with `PROXY_API_KEY`. |
+| `PROXY_API_KEY` | **Yes*** | API key for proxy authentication |
+| `LITELLM_MASTER_KEY` | No | Defaults to `PROXY_API_KEY` in entrypoint / `serve.py` |
+| `ADMIN_API_KEY` | No | Admin key for `/admin/routing/**` only (hot switch / deployment CRUD). Defaults to `PROXY_API_KEY + "admin"`. Not interchangeable with `PROXY_API_KEY`. |
 
-**Important:** The service will not start without `PROXY_API_KEY` set. See [docs/USAGE.md §9](docs/USAGE.md#9-热切流与模型-crud) for hot cutover, A/B weights, drain, and routing callbacks.
+\*Platform **EchoMind** injects `PROXY_API_KEY` (= job `secret_key`) into the pod — you do not maintain it in a repo `.env`. Local docker-compose / docker-rt still must pass it. See [docs/USAGE.md §9](docs/USAGE.md#9-热切流与模型-crud) for hot cutover, A/B weights, drain, and routing callbacks.
 
 #### Basic Configuration
 
@@ -135,8 +136,10 @@ Create `config/models.json` with your model configurations:
 | `TARGET_MODEL` | Yes | Target model name for training |
 | `ORIGIN_MODEL` | Yes | Original upstream model name |
 | `API_MODE` | Yes | Original API type (e.g., `openai`, `anthropic`, `custom`) |
-| `API_URL` | No | Custom API base URL (overrides default) |
-| `ACCESS_KEY` | Yes | API access key |
+| `API_URL` | No* | Upstream OpenAI-compatible base URL (to `/v1`) |
+| `ACCESS_KEY` | No* | Upstream Inference `inf_sk` |
+
+\*On platform EchoMind these come from the job request (`api_url` / access key) set by orch init — not from a hand-edited repo `.env`. For local docker-rt, orch injects them from SDK (`endpoint_url` + `inf_sk`) into the container env.
 
 #### Batch Mode (Hold Until Training Completes)
 
